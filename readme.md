@@ -26,6 +26,6 @@ To reproduce all results from the paper:
 python ./scripts/run_handcrafted_analyses.py  
 python ./scripts/train_all_rnns.py  
 python ./scripts/run_rnn_analyses.py [run only after all RNN training has finished]  
-python ./scripts/analyse_attractor_dynamics.py  [run only after RNN subspace identification has finished]
+python ./scripts/analyse_attractor_dynamics.py  [run only after RNN subspace identification has finished]  
 python ./figure_code/plot_all_figures.py
 
