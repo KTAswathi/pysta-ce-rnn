@@ -1,0 +1,10 @@
+
+numpy<2
+scikit-learn
+scipy
+
+matplotlib
+svgpathtools
+svgpath2mpl
+
+torch==2.2.2
