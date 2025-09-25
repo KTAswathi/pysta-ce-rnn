@@ -11,7 +11,7 @@ pip install -r requirements.txt
 
 pip install -e .
 
-Change the 'basedir' directory name in pysta/utils.py so it matches the path to the 'sta_code' folder locally.
+Change the 'basedir' directory name in ./pysta/utils.py so it matches the path to the base 'pysta' folder locally.
 
 Initialise all the directories you need to save results  
 python ./scripts/initialise_directories.py
