@@ -1,0 +1,9 @@
+{
+  "roi_name": "mpfc_union_gradient_nearest_a24_25_anchor25",
+  "roi_area_names": null,
+  "n_units": 347,
+  "seed": 42,
+  "source_type": "custom_vertex_file",
+  "custom_vertex_path": "/Users/mj23905/Documents/GitHub/pysta-cernn/data/embedding/custom_roi_vertices/mpfc_union_gradient_nearest_a24_25_anchor25_lh_vertex_indices.npy",
+  "geodesic_mode": "full"
+}

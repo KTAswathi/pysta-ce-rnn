@@ -6,8 +6,8 @@ import os
 import pickle
 from scipy.stats import pearsonr
 
-basedir = "/ceph/behrens/kris/research/sta_code/"
-
+# basedir = "/ceph/behrens/kris/research/sta_code/"
+basedir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 def reload():
     importlib.reload(pysta)
@@ -75,14 +75,23 @@ schematic_barriers = [(0,0),(3,1),(2,0),(5,1),(6,2),(7,3),(4,2),(5,3)]
 for barrier in schematic_barriers: schematic_walls[barrier[0], barrier[1]] = 1.0
 
 def get_rnn_name(kwargs):
-    
+
     # instantiate env and agent to generate name
     env = pysta.envs.MazeEnv(**kwargs)
-    rnn = pysta.agents.VanillaRNN(env, **kwargs)
+
+    model_type = kwargs.get("model_type", "vanilla")
+    if model_type == "vanilla":
+        rnn = pysta.agents.VanillaRNN(env, **kwargs)
+    elif model_type == "lineembedded":
+        rnn = pysta.agents.LineEmbeddedRNN(env, **kwargs)
+    elif model_type == "corticallyembedded":
+        rnn = pysta.agents.CorticallyEmbeddedRNN(env, **kwargs)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 
     # put these two parts together
     full_name = f"{env.name}/{rnn.name}"
-    
+
     return full_name
 
 def str_to_val(s):
@@ -136,7 +145,20 @@ def load_model(model_name, store_all_activity = True, greedy = True, force_optim
             
     figdir = f"{basedir}/figures/by_model/{addstr}{model_name}/"
     os.makedirs(figdir, exist_ok = True) # make the directory if it doesn't exist
-    datadir = f"{basedir}/data/rnn_analyses/{addstr}" + "_".join(model_name.split("/")) + "_"
+
+    # keep analysis outputs in nested folders instead of one huge filename
+    model_dir = os.path.dirname(model_name)
+    model_base = os.path.basename(model_name)
+
+    analysis_dir = os.path.join(
+        basedir,
+        "data",
+        "rnn_analyses",
+        f"{addstr}{model_dir}",
+    )
+    os.makedirs(analysis_dir, exist_ok=True)
+
+    datadir = os.path.join(analysis_dir, f"{model_base}_")
     
     rnn.store_all_activity = store_all_activity
     rnn.greedy = greedy

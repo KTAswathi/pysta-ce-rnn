@@ -21,7 +21,16 @@ def main_train(kwargs):
 
     # instantiate model
     env = pysta.envs.MazeEnv(**kwargs)
-    rnn = pysta.agents.VanillaRNN(env, **kwargs).to(device)
+
+    # choose between baseline, line-embedded, and cortical-embedded RNN
+    if kwargs["model_type"] == "vanilla":
+        rnn = pysta.agents.VanillaRNN(env, **kwargs).to(device)
+    elif kwargs["model_type"] == "lineembedded":
+        rnn = pysta.agents.LineEmbeddedRNN(env, **kwargs).to(device)
+    elif kwargs["model_type"] == "corticallyembedded":
+        rnn = pysta.agents.CorticallyEmbeddedRNN(env, **kwargs).to(device)
+    else:
+        raise ValueError(f"Unknown model_type: {kwargs['model_type']}")
 
     # create some filenames and directories
     dirname = f"{pysta.utils.basedir}/models/{env.name}/{rnn.name}"
@@ -72,7 +81,7 @@ def main_train(kwargs):
         optim.zero_grad() # reset gradient accumulator
         loss = rnn.forward() # compute loss
         loss.backward() # compute gradients
-        optim.step() # update parameters
+        optim.step() # update parameters
         
     if kwargs["save_results"]:
         pickle.dump({"epoch": epoch, "loss": all_losses, "accs": all_accs, "rnn": rnn, "best_loss": best_loss, "kwargs": kwargs, "optim": optim}, open(f"{savename}.p", "wb"))
@@ -80,6 +89,6 @@ def main_train(kwargs):
 
     return rnn
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
     kwargs = pysta.argparser.parse_args()
     main_train(kwargs)

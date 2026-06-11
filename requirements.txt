@@ -8,3 +8,7 @@ svgpathtools
 svgpath2mpl
 
 torch==2.2.2
+
+gdist
+nibabel
+nilearn

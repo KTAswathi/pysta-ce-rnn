@@ -1,31 +1,41 @@
+# pysta-cernn
 
-### Code for implementing, training, and analyzing spacetime attractors
+(Ongoing research) code for training and analysing cortically embedded recurrent neural networks for planning representations.
 
-To get started:
+This repository is adapted from Kris Jensen’s spacetime attractor/RNN codebase and is currently being extended to test whether planning representations in RNNs can develop spatial gradients when the recurrent units are embedded on an mPFC cortical surface.
 
+The project is under active development
+
+## Installation
+
+Create and activate a conda environment:
+
+```bash
 conda create -n pysta python=3.12 pip
-
 conda activate pysta
+```
 
+Install the package requirements:
+
+```bash
 pip install -r requirements.txt
-
 pip install -e .
+```
 
-Change the 'basedir' directory name in ./pysta/utils.py so it matches the path to the base 'pysta' folder locally.
+Current `requirements.txt`:
 
-Initialise all the directories you need to save results  
-python ./scripts/initialise_directories.py
+```text
+numpy<2
+scikit-learn
+scipy
 
-Run tests to check that everything works:  
-python ./tests/run_all_tests.py
+matplotlib
+svgpathtools
+svgpath2mpl
 
-To run some example handcrafted and RNN models:  
-python ./scripts/pysta_example_code.py
+torch==2.2.2
 
-To reproduce all results from the paper:  
-python ./scripts/run_handcrafted_analyses.py  
-python ./scripts/train_all_rnns.py  
-python ./scripts/run_rnn_analyses.py [run only after all RNN training has finished]  
-python ./scripts/analyse_attractor_dynamics.py  [run only after RNN subspace identification has finished]  
-python ./figure_code/plot_all_figures.py
-
+gdist
+nibabel
+nilearn
+```

@@ -1,0 +1,22 @@
+{
+  "roi_name": "mpfc_core",
+  "roi_area_names": [
+    "33pr",
+    "p24pr",
+    "a24pr",
+    "p24",
+    "a24",
+    "p32pr",
+    "a32pr",
+    "d32",
+    "p32",
+    "s32",
+    "8BM",
+    "9m",
+    "10v",
+    "10r",
+    "25"
+  ],
+  "n_units": 800,
+  "seed": 42
+}

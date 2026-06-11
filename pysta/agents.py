@@ -6,6 +6,9 @@ from torch import nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
+from pathlib import Path
+from pysta.embedding.mpfc_embedding import load_embedding
+
 #%% base agent
 class BaseAgent(nn.Module):
     classname = "BaseAgent"
@@ -516,6 +519,514 @@ class VanillaRNN(BaseAgent):
 
         return reg_loss
     
+# line-embedded version of VanillaRNN with optional local input/output anatomy
+class LineEmbeddedRNN(VanillaRNN):
+    classname = "LineEmbeddedRNN"
+    label = "line_rnn"
+
+    def __init__(
+        self,
+        env,
+        Nrec=800,
+        W_reg=1e-3,
+        r_reg=1e-3,
+        nonlin_output=False,
+        dist_reg=1e-7,
+        line_decay=0.12,
+        line_init_scale=1.5,
+        use_local_init=True,
+        localize_loc_input=False,
+        localize_rew_input=False,
+        localize_wall_input=False,
+        local_fraction=1.0 / 6.0,
+        readout_mode="global",
+        **kwargs,
+    ):
+        # geometry-related hyperparameters
+        self.dist_reg = dist_reg
+        self.line_decay = line_decay
+        self.line_init_scale = line_init_scale
+        self.use_local_init = use_local_init
+
+        # local input/ output options
+        self.localize_loc_input = localize_loc_input
+        self.localize_rew_input = localize_rew_input
+        self.localize_wall_input = localize_wall_input
+        self.local_fraction = local_fraction
+        self.readout_mode = readout_mode
+
+        if self.readout_mode not in ["global", "same_end", "opposite_end"]:
+            raise ValueError(
+                f"readout_mode must be one of ['global', 'same_end', 'opposite_end'], got {self.readout_mode}"
+            )
+
+        super(LineEmbeddedRNN, self).__init__(
+            env,
+            Nrec=Nrec,
+            W_reg=W_reg,
+            r_reg=r_reg,
+            nonlin_output=nonlin_output,
+            **kwargs,
+        )
+
+    @property
+    def name(self):
+        # append line-embedding + local I/O details
+        nonlin_str = "nonlinout" if self.nonlin_output else "linout"
+        basename = super(VanillaRNN, self).name
+        return (
+            f"{basename}/N{self.Nrec}_{nonlin_str}"
+            f"_line_ld{self.line_decay}_dr{self.dist_reg}"
+            f"_lfrac{self.local_fraction}"
+            f"_loc{int(self.localize_loc_input)}"
+            f"_rew{int(self.localize_rew_input)}"
+            f"_wall{int(self.localize_wall_input)}"
+            f"_ro{self.readout_mode}"
+        )
+
+    # helper: how many units belong to the local band
+    def _local_band_size(self):
+        return max(1, int(np.round(self.local_fraction * self.Nrec)))
+
+    # helper: first k units = same_end, last k units = opposite_end
+    def _make_unit_band_mask(self, mode):
+        mask = torch.zeros(self.Nrec, dtype=torch.float32)
+        k = self._local_band_size()
+
+        if mode == "global":
+            mask[:] = 1.0
+        elif mode == "same_end":
+            mask[:k] = 1.0
+        elif mode == "opposite_end":
+            mask[-k:] = 1.0
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        return mask
+
+    # helper: build input routing masks from env.obs_inds()
+    def _build_input_masks(self):
+        inds = self.env.obs_inds()
+        loc_inds = torch.as_tensor(inds["loc"], dtype=torch.long)
+        rew_inds = torch.as_tensor(inds["goal"], dtype=torch.long)
+        wall_inds = torch.as_tensor(inds["walls"], dtype=torch.long)
+
+        all_units = torch.arange(self.Nrec, dtype=torch.long)
+        same_end_units = torch.where(self.same_end_unit_mask > 0)[0]
+
+        # start with empty masks; we will fill only the relevant columns
+        mask_loc = torch.zeros(self.Nrec, self.Nin, dtype=torch.float32)
+        mask_rew = torch.zeros(self.Nrec, self.Nin, dtype=torch.float32)
+        mask_wall = torch.zeros(self.Nrec, self.Nin, dtype=torch.float32)
+
+        # current-location channels
+        loc_target_units = same_end_units if self.localize_loc_input else all_units
+        mask_loc[loc_target_units[:, None], loc_inds[None, :]] = 1.0
+
+        # future-reward channels
+        rew_target_units = same_end_units if self.localize_rew_input else all_units
+        mask_rew[rew_target_units[:, None], rew_inds[None, :]] = 1.0
+
+        # wall channels
+        wall_target_units = same_end_units if self.localize_wall_input else all_units
+        mask_wall[wall_target_units[:, None], wall_inds[None, :]] = 1.0
+
+        self.register_buffer("mask_loc", mask_loc)
+        self.register_buffer("mask_rew", mask_rew)
+        self.register_buffer("mask_wall", mask_wall)
+
+    def initialise_weights(self):
+        """
+        Same overall architecture as VanillaRNN, but recurrent weights are
+        initialised with a distance-biased random pattern on a 1D line.
+        Inputs and readout can optionally be localized.
+        """
+
+        # RNN initial condition
+        self.z0 = nn.Parameter(torch.randn(self.Nrec, 1), requires_grad=True)
+
+        # 1D line embedding: unit positions and distance matrix
+        positions = torch.linspace(0.0, 1.0, steps=self.Nrec)
+        D = torch.abs(positions[:, None] - positions[None, :])
+
+        # rescale distances so the regulariser is numerically well-behaved
+        D = D / D.mean().clamp(min=1e-8)
+
+        self.register_buffer("unit_positions", positions)
+        self.register_buffer("distance_matrix", D)
+
+        # define same-end and opposite-end bands once, for reuse in input/output routing
+        self.register_buffer("same_end_unit_mask", self._make_unit_band_mask("same_end"))
+        self.register_buffer("opposite_end_unit_mask", self._make_unit_band_mask("opposite_end"))
+
+        if self.readout_mode == "global":
+            readout_mask = self._make_unit_band_mask("global")
+        elif self.readout_mode == "same_end":
+            readout_mask = self._make_unit_band_mask("same_end")
+        elif self.readout_mode == "opposite_end":
+            readout_mask = self._make_unit_band_mask("opposite_end")
+        else:
+            raise ValueError(f"Unknown readout_mode: {self.readout_mode}")
+
+        self.register_buffer("readout_unit_mask", readout_mask)
+
+        # nearby units connect more strongly at init
+        locality = torch.exp(-self.distance_matrix / self.line_decay)
+
+        # signed random recurrent weights, modulated by locality
+        Wrec = (
+            self.line_init_scale
+            * torch.randn(self.Nrec, self.Nrec)
+            / np.sqrt(self.Nrec)
+        )
+        if self.use_local_init:
+            Wrec = Wrec * locality
+
+        self.Wrec = nn.Parameter(Wrec, requires_grad=True)
+
+        # input matrix is still learnable, but routing will be controlled by masks
+        self.Win = nn.Parameter(
+            torch.randn(self.Nrec, self.Nin) / np.sqrt(self.Nin),
+            requires_grad=True,
+        )
+
+        # hidden state bias
+        self.brec = nn.Parameter(torch.zeros(self.Nrec, 1), requires_grad=True)
+
+        # build input routing masks after Win/Nin/Nrec are known
+        self._build_input_masks()
+
+        # output layer stays exactly like VanillaRNN
+        if self.nonlin_output:
+            self.Wout1 = nn.Parameter(
+                torch.randn(int(np.round(self.Nrec / 2)), self.Nrec)
+                / np.sqrt(self.Nrec),
+                requires_grad=True,
+            )
+            self.bout1 = nn.Parameter(
+                torch.zeros(self.Wout1.shape[0], 1),
+                requires_grad=True,
+            )
+
+            self.Wout = nn.Parameter(
+                torch.randn(self.Nout, self.Wout1.shape[0])
+                / np.sqrt(self.Wout1.shape[0]),
+                requires_grad=True,
+            )
+            self.bout = nn.Parameter(torch.zeros(self.Nout, 1), requires_grad=True)
+
+        else:
+            self.Wout = nn.Parameter(
+                torch.randn(self.Nout, self.Nrec) / np.sqrt(self.Nrec),
+                requires_grad=True,
+            )
+            self.bout = nn.Parameter(torch.zeros(self.Nout, 1), requires_grad=True)
+
+        return
+
+    def step(self, observation):
+        """
+        Perform all computations before the next environment update step.
+        Same as VanillaRNN, but with optional local input routing and optional local/global readout.
+        """
+
+        batch = observation.shape[0]
+
+        network_iters = (
+            self.iters_per_action
+            if type(self.iters_per_action) in [int, np.int32, np.int64]
+            else np.random.choice(self.iters_per_action)
+        )
+
+        for _ in range(network_iters):
+            rec_noise = torch.randn(batch, self.Nrec, 1, device=self.z0.device) * self.rec_noise
+
+            # split the input into separately routed components
+            obs_col = observation[..., None]  # (batch, Nin, 1)
+
+            ff_loc = (self.Win * self.mask_loc) @ obs_col
+            ff_rew = (self.Win * self.mask_rew) @ obs_col
+            ff_wall = (self.Win * self.mask_wall) @ obs_col
+            ff_inp = ff_loc + ff_rew + ff_wall
+
+            rec_inp = self.Wrec @ self.r
+
+            self.z = (1 - 1 / self.tau) * self.z + (1 / self.tau) * (
+                rec_inp + ff_inp + self.brec + rec_noise
+            )
+
+            self.r = self.phi(self.z)
+
+            self.rate_loss = self.rate_loss + self.calc_activity_reg(
+                torch.where(~self.env.finished)[0]
+            )
+
+            if self.store_all_activity:
+                self.all_acts[0].append(self.r.detach().numpy())
+                self.all_acts[1].append(self.env.loc.detach().numpy())
+                self.all_acts[2].append(self.env.step_num)
+
+        # restrict which units contribute to the readout
+        masked_r = self.r * self.readout_unit_mask[None, :, None]
+
+        if self.nonlin_output:
+            rout = self.phi(self.Wout1 @ masked_r + self.bout1)
+        else:
+            rout = masked_r
+
+        self.logpi = (self.Wout @ rout + self.bout)[..., 0]
+
+        self.logpi = self.logpi - self.logpi.logsumexp(-1, keepdims=True)
+        self.pi = self.logpi.exp()
+
+        self.action = self.sample_action()
+
+        return self.action
+
+    def calc_parameter_reg(self):
+        """
+        Original L2 penalty + distance-weighted recurrent penalty.
+        """
+
+        # original L2 regularisation on all parameters
+        l2_loss = self.W_reg * torch.stack(
+            [torch.square(p).sum() for p in self.parameters()]
+        ).sum()
+
+        # distance penalty on recurrent weights only
+        dist_loss = self.dist_reg * (
+            torch.abs(self.Wrec) * self.distance_matrix
+        ).sum()
+
+        return l2_loss + dist_loss
+
+
+# corticallyembedded version of LineEmbeddedRNN
+class CorticallyEmbeddedRNN(LineEmbeddedRNN):
+    classname = "CorticallyEmbeddedRNN"
+    label = "cortical_rnn"
+
+    def __init__(
+        self,
+        env,
+        Nrec=800,
+        W_reg=1e-3,
+        r_reg=1e-3,
+        nonlin_output=False,
+        dist_reg=1e-7,
+        line_decay=0.12,
+        line_init_scale=1.5,
+        use_local_init=True,
+        localize_loc_input=False,
+        localize_rew_input=False,
+        localize_wall_input=False,
+        local_fraction=1.0 / 6.0,
+        readout_mode="global",
+        embedding_name="mpfc_very_focused",
+        embedding_species="human",
+        embedding_seed=42,
+        anchor_area_names=None,
+        **kwargs,
+    ):
+        self.embedding_name = embedding_name
+        self.embedding_species = embedding_species
+        self.embedding_seed = embedding_seed
+        self.anchor_area_names = (
+            # ["25", "10v", "10r", "a24", "p24"]
+            ["p32", "p32pr", "d32"]
+            if anchor_area_names is None
+            else list(anchor_area_names)
+        )
+
+        super(CorticallyEmbeddedRNN, self).__init__(
+            env,
+            Nrec=Nrec,
+            W_reg=W_reg,
+            r_reg=r_reg,
+            nonlin_output=nonlin_output,
+            dist_reg=dist_reg,
+            line_decay=line_decay,
+            line_init_scale=line_init_scale,
+            use_local_init=use_local_init,
+            localize_loc_input=localize_loc_input,
+            localize_rew_input=localize_rew_input,
+            localize_wall_input=localize_wall_input,
+            local_fraction=local_fraction,
+            readout_mode=readout_mode,
+            **kwargs,
+        )
+
+    @property
+    def name(self):
+        nonlin_str = "nonlinout" if self.nonlin_output else "linout"
+        basename = super(VanillaRNN, self).name
+        anchor_str = "-".join(self.anchor_area_names)
+        return (
+            f"{basename}/N{self.Nrec}_{nonlin_str}"
+            f"_cortical_{self.embedding_name}_eseed{self.embedding_seed}"
+            f"_ld{self.line_decay}_dr{self.dist_reg}"
+            f"_lfrac{self.local_fraction}"
+            f"_loc{int(self.localize_loc_input)}"
+            f"_rew{int(self.localize_rew_input)}"
+            f"_wall{int(self.localize_wall_input)}"
+            f"_ro{self.readout_mode}"
+            f"_anchor{anchor_str}"
+        )
+
+    def _embedding_dir(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        return (
+            repo_root
+            / "data"
+            / "embedding"
+            / "subsampled"
+            / self.embedding_species
+            / self.embedding_name
+            / f"units={self.Nrec}_seed={self.embedding_seed}"
+        )
+
+    def _load_cortical_embedding(self):
+        embedding_dir = self._embedding_dir()
+        if not embedding_dir.exists():
+            raise FileNotFoundError(
+                f"Could not find cortical embedding at {embedding_dir}. "
+                "Create it first with pysta.embedding.mpfc_embedding."
+            )
+
+        embedding = load_embedding(embedding_dir)
+
+        D = torch.tensor(embedding["distance_matrix"], dtype=torch.float32)
+        if D.shape != (self.Nrec, self.Nrec):
+            raise ValueError(
+                f"Embedding distance matrix has shape {tuple(D.shape)}, "
+                f"expected {(self.Nrec, self.Nrec)}."
+            )
+
+        # keep distance scale numerically similar to line version
+        D = D / D.mean().clamp(min=1e-8)
+
+        area_labels = list(embedding["area_labels"])
+        sampled_indices = torch.tensor(embedding["sampled_indices"], dtype=torch.long)
+
+        return D, area_labels, sampled_indices
+
+    def _make_cortical_band_mask_from_anchor(self, anchor_idx):
+        mask = torch.zeros(self.Nrec, dtype=torch.float32)
+        k = self._local_band_size()
+        nearest = torch.argsort(self.distance_matrix[anchor_idx])[:k]
+        mask[nearest] = 1.0
+        return mask
+
+    def _choose_anchor_index(self, area_labels):
+        candidate_inds = [i for i, area in enumerate(area_labels) if area in self.anchor_area_names]
+        if len(candidate_inds) == 0:
+            raise ValueError(
+                f"None of anchor_area_names={self.anchor_area_names} "
+                "were present in sampled area labels."
+            )
+
+        cand = torch.tensor(candidate_inds, dtype=torch.long)
+
+        # choose centroid-most sampled unit within proxy hippocampal-facing subset
+        cand_D = self.distance_matrix[cand][:, cand]
+        anchor_local = torch.argmin(cand_D.mean(dim=1))
+
+        return int(cand[anchor_local].item())
+
+    def initialise_weights(self):
+        """
+        Same logic as LineEmbeddedRNN, but replace the 1D line geometry
+        with the saved cortical MPFC embedding.
+        """
+
+        # RNN initial condition
+        self.z0 = nn.Parameter(torch.randn(self.Nrec, 1), requires_grad=True)
+
+        # load cortical embedding
+        D, area_labels, sampled_indices = self._load_cortical_embedding()
+        self.sampled_area_labels = area_labels
+
+        self.register_buffer("sampled_vertex_indices", sampled_indices)
+        self.register_buffer("distance_matrix", D)
+
+        # define cortical analogue of same_end/opposite_end
+        anchor_idx = self._choose_anchor_index(area_labels)
+        opposite_anchor_idx = int(torch.argmax(self.distance_matrix[anchor_idx]).item())
+
+        self.anchor_index = anchor_idx
+        self.opposite_anchor_index = opposite_anchor_idx
+
+        self.register_buffer(
+            "same_end_unit_mask",
+            self._make_cortical_band_mask_from_anchor(anchor_idx),
+        )
+        self.register_buffer(
+            "opposite_end_unit_mask",
+            self._make_cortical_band_mask_from_anchor(opposite_anchor_idx),
+        )
+
+        if self.readout_mode == "global":
+            readout_mask = torch.ones(self.Nrec, dtype=torch.float32)
+        elif self.readout_mode == "same_end":
+            readout_mask = self.same_end_unit_mask.clone()
+        elif self.readout_mode == "opposite_end":
+            readout_mask = self.opposite_end_unit_mask.clone()
+        else:
+            raise ValueError(f"Unknown readout_mode: {self.readout_mode}")
+
+        self.register_buffer("readout_unit_mask", readout_mask)
+
+        # local recurrent init on cortical geodesic distances
+        locality = torch.exp(-self.distance_matrix / self.line_decay)
+
+        Wrec = (
+            self.line_init_scale
+            * torch.randn(self.Nrec, self.Nrec)
+            / np.sqrt(self.Nrec)
+        )
+        if self.use_local_init:
+            Wrec = Wrec * locality
+
+        self.Wrec = nn.Parameter(Wrec, requires_grad=True)
+
+        # input matrix is learnable; routing handled by masks
+        self.Win = nn.Parameter(
+            torch.randn(self.Nrec, self.Nin) / np.sqrt(self.Nin),
+            requires_grad=True,
+        )
+
+        self.brec = nn.Parameter(torch.zeros(self.Nrec, 1), requires_grad=True)
+
+        # re-use existing input routing
+        self._build_input_masks()
+
+        # output layer exactly as before
+        if self.nonlin_output:
+            self.Wout1 = nn.Parameter(
+                torch.randn(int(np.round(self.Nrec / 2)), self.Nrec)
+                / np.sqrt(self.Nrec),
+                requires_grad=True,
+            )
+            self.bout1 = nn.Parameter(
+                torch.zeros(self.Wout1.shape[0], 1),
+                requires_grad=True,
+            )
+
+            self.Wout = nn.Parameter(
+                torch.randn(self.Nout, self.Wout1.shape[0])
+                / np.sqrt(self.Wout1.shape[0]),
+                requires_grad=True,
+            )
+            self.bout = nn.Parameter(torch.zeros(self.Nout, 1), requires_grad=True)
+
+        else:
+            self.Wout = nn.Parameter(
+                torch.randn(self.Nout, self.Nrec) / np.sqrt(self.Nrec),
+                requires_grad=True,
+            )
+            self.bout = nn.Parameter(torch.zeros(self.Nout, 1), requires_grad=True)
+
+        return
 
 #%% Handcrafted spacetime attractor
 

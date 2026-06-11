@@ -1,0 +1,13 @@
+{
+  "roi_name": "mpfc_very_focused",
+  "roi_area_names": [
+    "a32pr",
+    "d32",
+    "p32",
+    "p32pr",
+    "8BM",
+    "9m"
+  ],
+  "n_units": 800,
+  "seed": 42
+}
