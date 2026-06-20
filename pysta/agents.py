@@ -832,7 +832,6 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
         self.embedding_species = embedding_species
         self.embedding_seed = embedding_seed
         self.anchor_area_names = (
-            # ["25", "10v", "10r", "a24", "p24"]
             ["p32", "p32pr", "d32"]
             if anchor_area_names is None
             else list(anchor_area_names)
@@ -860,7 +859,13 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
     def name(self):
         nonlin_str = "nonlinout" if self.nonlin_output else "linout"
         basename = super(VanillaRNN, self).name
-        anchor_str = "-".join(self.anchor_area_names)
+
+        # if embedding has auto anchor-unit file, name the run accordingly
+        if (self._embedding_dir() / "anchor_unit_indices.npy").exists():
+            anchor_str = "autoanchor"
+        else:
+            anchor_str = "-".join(self.anchor_area_names)
+
         return (
             f"{basename}/N{self.Nrec}_{nonlin_str}"
             f"_cortical_{self.embedding_name}_eseed{self.embedding_seed}"
@@ -903,18 +908,51 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
             )
 
         # keep distance scale numerically similar to line version
-        D = D / D.mean().clamp(min=1e-8)
+        D = D / D.mean().clamp(min=1e-8) 
 
         area_labels = list(embedding["area_labels"])
         sampled_indices = torch.tensor(embedding["sampled_indices"], dtype=torch.long)
 
         return D, area_labels, sampled_indices
 
+    def _load_auto_anchor_unit_indices(self):
+        # auto-load anchor/input zone from embedding dir if present
+        anchor_path = self._embedding_dir() / "anchor_unit_indices.npy"
+
+        if not anchor_path.exists():
+            return None
+
+        anchor_unit_indices = np.load(anchor_path).astype(np.int64).reshape(-1)
+        anchor_unit_indices = np.unique(anchor_unit_indices).astype(np.int64)
+
+        if len(anchor_unit_indices) == 0:
+            raise ValueError(f"Auto anchor file is empty: {anchor_path}")
+
+        if np.min(anchor_unit_indices) < 0 or np.max(anchor_unit_indices) >= self.Nrec:
+            raise ValueError(
+                f"Auto anchor indices in {anchor_path} are outside valid unit range "
+                f"0..{self.Nrec - 1}."
+            )
+
+        print("\nUsing auto anchor/input zone from embedding:")
+        print(f"  {anchor_path}")
+        print(f"  anchor units: {len(anchor_unit_indices)} / {self.Nrec}")
+        print(f"  fraction: {len(anchor_unit_indices) / float(self.Nrec):.4f}")
+
+        return torch.tensor(anchor_unit_indices, dtype=torch.long)
+
     def _make_cortical_band_mask_from_anchor(self, anchor_idx):
         mask = torch.zeros(self.Nrec, dtype=torch.float32)
         k = self._local_band_size()
         nearest = torch.argsort(self.distance_matrix[anchor_idx])[:k]
         mask[nearest] = 1.0
+        return mask
+
+    def _make_cortical_band_mask_from_unit_indices(self, unit_indices):
+        # exact mask from precomputed anchor/input units
+        mask = torch.zeros(self.Nrec, dtype=torch.float32)
+        unit_indices = torch.as_tensor(unit_indices, dtype=torch.long)
+        mask[unit_indices] = 1.0
         return mask
 
     def _choose_anchor_index(self, area_labels):
@@ -928,6 +966,18 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
         cand = torch.tensor(candidate_inds, dtype=torch.long)
 
         # choose centroid-most sampled unit within proxy hippocampal-facing subset
+        cand_D = self.distance_matrix[cand][:, cand]
+        anchor_local = torch.argmin(cand_D.mean(dim=1))
+
+        return int(cand[anchor_local].item())
+
+    def _choose_anchor_index_from_unit_indices(self, unit_indices):
+        # representative anchor for an explicit anchor/input zone
+        cand = torch.as_tensor(unit_indices, dtype=torch.long)
+
+        if len(cand) == 1:
+            return int(cand[0].item())
+
         cand_D = self.distance_matrix[cand][:, cand]
         anchor_local = torch.argmin(cand_D.mean(dim=1))
 
@@ -949,17 +999,40 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
         self.register_buffer("sampled_vertex_indices", sampled_indices)
         self.register_buffer("distance_matrix", D)
 
-        # define cortical analogue of same_end/opposite_end
-        anchor_idx = self._choose_anchor_index(area_labels)
-        opposite_anchor_idx = int(torch.argmax(self.distance_matrix[anchor_idx]).item())
+        # prefer auto anchor/input zone saved inside embedding dir
+        auto_anchor_unit_indices = self._load_auto_anchor_unit_indices()
+
+        if auto_anchor_unit_indices is not None:
+            anchor_idx = self._choose_anchor_index_from_unit_indices(
+                auto_anchor_unit_indices
+            )
+
+            same_end_mask = self._make_cortical_band_mask_from_unit_indices(
+                auto_anchor_unit_indices
+            )
+
+            # opposite end = unit farthest on average from full input/anchor zone
+            mean_distance_to_anchor_zone = self.distance_matrix[
+                :, auto_anchor_unit_indices
+            ].mean(dim=1)
+            opposite_anchor_idx = int(torch.argmax(mean_distance_to_anchor_zone).item())
+
+            self.anchor_unit_indices = [
+                int(x) for x in auto_anchor_unit_indices.detach().cpu().numpy()
+            ]
+
+        else:
+            # original behaviour: define anchor by sampled parcel labels
+            anchor_idx = self._choose_anchor_index(area_labels)
+            opposite_anchor_idx = int(torch.argmax(self.distance_matrix[anchor_idx]).item())
+
+            same_end_mask = self._make_cortical_band_mask_from_anchor(anchor_idx)
+            self.anchor_unit_indices = None
 
         self.anchor_index = anchor_idx
         self.opposite_anchor_index = opposite_anchor_idx
 
-        self.register_buffer(
-            "same_end_unit_mask",
-            self._make_cortical_band_mask_from_anchor(anchor_idx),
-        )
+        self.register_buffer("same_end_unit_mask", same_end_mask)
         self.register_buffer(
             "opposite_end_unit_mask",
             self._make_cortical_band_mask_from_anchor(opposite_anchor_idx),

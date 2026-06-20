@@ -70,6 +70,17 @@ def parse_args(**kwargs):
         default=["25"],
         help="sampled parcel labels used to define the proxy hippocampal-facing anchor",
     )
+    parser.add_argument(
+        '--anchor_vertex_file',
+        default=None,
+        type=str,
+        help=(
+            "Optional .npy file defining explicit anchor/input vertices. "
+            "If provided, this overrides anchor_area_names for CorticallyEmbeddedRNN. "
+            "Can be an absolute path, a path relative to repo root, or a filename in "
+            "data/embedding/custom_roi_vertices."
+        ),
+    )
 
     # training args
     parser.add_argument('--batch_size', type=int, default=200, help="batch size for the environment")
