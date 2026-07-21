@@ -5,7 +5,21 @@ It mirrors the fMRI analysis script ('https://github.com/skuechenhoff/multiple_c
 as closely as possible, replacing voxel-volume operations with surface-unit operations:
 
     fMRI map per lag/condition
-        -> model delay-specific score map over RNN units / fsLR vertices
+        -> model lag-specific score map over RNN units / fsLR vertices
+
+Three alternative score-map sources are available before the common spatial
+pipeline:
+
+    score_source="subspace" (existing/default analysis)
+        -> norm of planning-subspace coefficients over locations
+
+    score_source="raw_activity"
+        -> RMS variation of mean planning activity across future-location
+           conditions, fitted separately for each lag
+
+    score_source="glm"
+        -> RMS categorical location effect from one joint encoding GLM that
+           includes all lags simultaneously
 
     mode="voxel"
         -> strongest model unit / surface vertex in the delay map
@@ -24,15 +38,29 @@ The main fMRI analogous question is:
 
     Does one coordinate axis, e.g. surface z, change with delay/lag?
 
-Prerequisite:
-    python scripts/analyse_rnn.py "$MODEL" collect time decoding subspaces
+Prerequisites:
+    # Needed by all score sources:
+    python scripts/analyse_rnn.py "$MODEL" collect
+
+    # Additionally needed only for score_source=subspace:
+    python scripts/analyse_rnn.py "$MODEL" subspaces
 
 Typical usage:
     MODEL="MazeEnv.../model0"
+
+    # Existing analysis, unchanged in meaning:
     PYTHONPATH="$PWD" python scripts/analyse_fmri_analogous_model_gradient.py "$MODEL" \
-        --axis z \
-        --cluster_threshold 90 \
-        --n_clusters 3
+        --score_source subspace --axis z --cluster_threshold 90 --n_clusters 3
+
+    # Raw planning-activity condition-effect maps:
+    PYTHONPATH="$PWD" python scripts/analyse_fmri_analogous_model_gradient.py "$MODEL" \
+        --score_source raw_activity --planning_times=-2,-1 \
+        --lag_times=0,1,2,3,4,5 --axis z --cluster_threshold 90 --n_clusters 3
+
+    # Joint all-lag categorical GLM maps:
+    PYTHONPATH="$PWD" python scripts/analyse_fmri_analogous_model_gradient.py "$MODEL" \
+        --score_source glm --planning_times=-2,-1 \
+        --lag_times=0,1,2,3,4,5 --axis z --cluster_threshold 90 --n_clusters 3
 """
 
 from __future__ import annotations
@@ -66,6 +94,12 @@ ANALYSIS_REL = Path("data/rnn_analyses")
 EMBEDDING_REL = Path("data/embedding/subsampled/human")
 
 PEAK_MODES = ["voxel", "cluster_peak", "cluster_com"]
+SCORE_SOURCES = ["subspace", "raw_activity", "glm"]
+SCORE_SOURCE_LABELS = {
+    "subspace": "planning-subspace coefficient norm",
+    "raw_activity": "raw planning-activity condition effect",
+    "glm": "joint all-lag categorical GLM effect",
+}
 
 VERTEX_FILE_CANDIDATES = [
     "sampled_indices.npy",       # this repo's embedding file: fsLR vertex per unit
@@ -180,6 +214,31 @@ def find_planning_subspaces_pickle(analysis_dir: Path) -> Path:
     )
 
 
+def find_trial_data_pickle(analysis_dir: Path) -> Path:
+    """Find the trial-data pickle produced by analyse_rnn.py collect."""
+    candidates = [
+        analysis_dir / "trial_data.pickle",
+        analysis_dir / "model0_trial_data.pickle",
+    ]
+    candidates.extend(sorted(analysis_dir.glob("*trial_data*.pickle")))
+
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.is_file():
+            return path
+
+    existing = "\n".join(f"  {p.name}" for p in sorted(analysis_dir.glob("*.pickle")))
+    raise FileNotFoundError(
+        "Could not find trial_data.pickle. Run first:\n"
+        '  python scripts/analyse_rnn.py "$MODEL" collect\n\n'
+        f"Analysis dir: {analysis_dir}\n"
+        f"Existing pickle files:\n{existing if existing else '  <none>'}"
+    )
+
+
 def load_surface(repo_root: Path) -> tuple[np.ndarray, np.ndarray]:
     surf_path = repo_root / SURF_REL
     if not surf_path.is_file():
@@ -227,6 +286,7 @@ def plot_delay_score_surface_qc(
     bg_sulc: np.ndarray | None,
     unit_vertices: np.ndarray,
     out_dir: Path,
+    score_source_label: str,
 ) -> None:
     """
     Surface QC plot for model analogue.
@@ -289,8 +349,8 @@ def plot_delay_score_surface_qc(
         ax.axis("off")
 
     fig.suptitle(
-        "fmri-style model analogue: delay-specific score maps\n"
-        "fsLR/Conte69 surface; not MNI; not anchor distance",
+        "fMRI-style model analogue: lag-specific score maps\n"
+        f"source: {score_source_label} | fsLR/Conte69 surface; not MNI",
         fontsize=13,
     )
 
@@ -312,6 +372,7 @@ def plot_strongest_cluster_surface_qc(
     adjacency: list[set[int]],
     cluster_threshold: str | float,
     out_dir: Path,
+    score_source_label: str,
 ) -> None:
     """
     Surface QC plot showing only the strongest thresholded cluster per delay.
@@ -406,8 +467,8 @@ def plot_strongest_cluster_surface_qc(
         ax.axis("off")
 
     fig.suptitle(
-        "fmri-style model analogue: strongest thresholded cluster per delay\n"
-        f"cluster threshold = {cluster_threshold}",
+        "fMRI-style model analogue: strongest thresholded cluster per lag\n"
+        f"source: {score_source_label} | cluster threshold = {cluster_threshold}",
         fontsize=13,
     )
 
@@ -576,6 +637,363 @@ def csubs_to_delay_scores(csubs: np.ndarray, n_units: int, delay_axis: str = "au
     print(f"[INFO] Csubs original shape: {csubs.shape}")
     print(f"[INFO] delay_scores shape: {delay_scores.shape}  # delay x unit")
     return delay_scores
+
+
+def parse_int_list(value: str | None, argument_name: str) -> list[int] | None:
+    """Parse a comma-separated integer list."""
+    if value is None or value.strip() == "":
+        return None
+
+    try:
+        values = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError(f"{argument_name} must be comma-separated integers.") from exc
+
+    if not values:
+        raise ValueError(f"{argument_name} did not contain any integers.")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{argument_name} contains duplicate values: {values}")
+    return values
+
+
+def load_trial_data(trial_data_path: Path, n_units: int) -> dict[str, Any]:
+    with open(trial_data_path, "rb") as f:
+        trial_data = pickle.load(f)
+
+    if not isinstance(trial_data, dict):
+        raise TypeError(f"Expected trial_data to be a dict, got {type(trial_data)!r}")
+
+    required = ["rs", "step_nums", "locs"]
+    missing = [key for key in required if key not in trial_data]
+    if missing:
+        raise KeyError(f"trial_data is missing required keys: {missing}")
+
+    rs = np.asarray(trial_data["rs"])
+    if rs.ndim != 3 or rs.shape[-1] != n_units:
+        raise ValueError(
+            f"Expected trial_data['rs'] shape (trials, time, {n_units}), got {rs.shape}"
+        )
+
+    return trial_data
+
+
+def aligned_step_values(step_nums: np.ndarray) -> np.ndarray:
+    """Return the common task-time value represented by each stored time index."""
+    step_nums = np.asarray(step_nums, dtype=float)
+    if step_nums.ndim == 3 and step_nums.shape[-1] == 1:
+        step_nums = step_nums[..., 0]
+    if step_nums.ndim != 2:
+        raise ValueError(
+            "Expected step_nums shape (trials, time) or (trials, time, 1), "
+            f"got {step_nums.shape}"
+        )
+
+    step_values = np.nanmean(step_nums, axis=0)
+    variability = np.nanstd(step_nums, axis=0)
+    finite_variability = variability[np.isfinite(variability)]
+    if finite_variability.size and np.nanmax(finite_variability) > 1e-6:
+        raise ValueError(
+            "Trials are not aligned to the same step_num at each stored time index. "
+            "This analysis currently requires aligned trial_data."
+        )
+    return step_values
+
+
+def find_time_indices(step_values: np.ndarray, requested_times: list[int], name: str) -> list[int]:
+    indices: list[int] = []
+    for requested in requested_times:
+        matches = np.where(np.isfinite(step_values) & np.isclose(step_values, requested))[0]
+        if matches.size != 1:
+            available = [int(round(x)) for x in step_values[np.isfinite(step_values)]]
+            raise ValueError(
+                f"Could not identify exactly one stored index for {name}={requested}. "
+                f"Available aligned step values: {available}"
+            )
+        indices.append(int(matches[0]))
+    return indices
+
+
+def prepare_activity_lag_data(
+    trial_data: dict[str, Any],
+    planning_times: list[int],
+    lag_times: list[int] | None,
+    activity_standardization: str,
+) -> tuple[np.ndarray, np.ndarray, list[int], int]:
+    """
+    Extract one planning-activity vector and one future-location label per lag/trial.
+
+    Returns
+    -------
+    planning_activity : trials x units
+        Mean RNN activity across the requested planning times.
+    lag_locations : trials x lags
+        Location label at each requested non-negative task time.
+    lag_times : list[int]
+        Actual lag/task-time labels used.
+    num_locs : int
+        Number of discrete maze locations inferred from trial_data.
+    """
+    rs = np.asarray(trial_data["rs"], dtype=float)
+    step_nums = np.asarray(trial_data["step_nums"], dtype=float)
+    locs = np.asarray(trial_data["locs"], dtype=float)
+
+    if locs.ndim == 3 and locs.shape[-1] == 1:
+        locs = locs[..., 0]
+    if locs.ndim != 2:
+        raise ValueError(
+            "Expected locs shape (trials, time) or (trials, time, 1), "
+            f"got {locs.shape}"
+        )
+
+    step_values = aligned_step_values(step_nums)
+    planning_indices = find_time_indices(step_values, planning_times, "planning_time")
+
+    if lag_times is None:
+        lag_times = sorted(
+            {
+                int(round(value))
+                for value in step_values
+                if np.isfinite(value) and value >= 0 and np.isclose(value, round(value))
+            }
+        )
+        if not lag_times:
+            raise ValueError("No non-negative lag times were found in trial_data.")
+
+    lag_indices = find_time_indices(step_values, lag_times, "lag_time")
+
+    with np.errstate(invalid="ignore"):
+        planning_activity = np.nanmean(rs[:, planning_indices, :], axis=1)
+    lag_locations = locs[:, lag_indices]
+
+    finite_locs = locs[np.isfinite(locs)]
+    if finite_locs.size == 0:
+        raise ValueError("No finite location labels found in trial_data.")
+    num_locs = int(np.nanmax(finite_locs)) + 1
+
+    if activity_standardization == "zscore":
+        mean = np.nanmean(planning_activity, axis=0, keepdims=True)
+        sd = np.nanstd(planning_activity, axis=0, keepdims=True)
+        planning_activity = (planning_activity - mean) / (sd + 1e-10)
+    elif activity_standardization != "none":
+        raise ValueError("activity_standardization must be 'none' or 'zscore'.")
+
+    print(f"[INFO] Planning times: {planning_times} -> stored indices {planning_indices}")
+    print(f"[INFO] Lag times:      {lag_times} -> stored indices {lag_indices}")
+    print(f"[INFO] planning_activity shape: {planning_activity.shape}")
+    print(f"[INFO] lag_locations shape:     {lag_locations.shape}")
+    print(f"[INFO] inferred num_locs:       {num_locs}")
+    print(f"[INFO] activity standardization: {activity_standardization}")
+
+    return planning_activity, lag_locations, lag_times, num_locs
+
+
+def raw_activity_to_delay_scores(
+    planning_activity: np.ndarray,
+    lag_locations: np.ndarray,
+    num_locs: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Construct a raw-activity condition-effect map for every lag.
+
+    For each lag and unit:
+      1. compute mean planning activity for every future-location condition;
+      2. centre those condition means across locations;
+      3. take their root-mean-square magnitude.
+
+    This yields a non-negative lag x unit map without fitting a decoder.
+    """
+    n_lags = lag_locations.shape[1]
+    n_units = planning_activity.shape[1]
+    delay_scores = np.full((n_lags, n_units), np.nan, dtype=float)
+    n_trials_per_lag: list[int] = []
+    n_locations_per_lag: list[int] = []
+
+    activity_valid = np.all(np.isfinite(planning_activity), axis=1)
+
+    for lag_index in range(n_lags):
+        locations = lag_locations[:, lag_index]
+        valid = activity_valid & np.isfinite(locations)
+        y = planning_activity[valid]
+        labels = locations[valid].astype(int)
+
+        condition_means = np.full((num_locs, n_units), np.nan, dtype=float)
+        for location in range(num_locs):
+            condition_trials = labels == location
+            if np.any(condition_trials):
+                condition_means[location] = np.mean(y[condition_trials], axis=0)
+
+        present = np.all(np.isfinite(condition_means), axis=1)
+        if np.sum(present) < 2:
+            raise ValueError(
+                f"Lag index {lag_index} has fewer than two represented location conditions."
+            )
+
+        effects = condition_means[present]
+        effects = effects - np.mean(effects, axis=0, keepdims=True)
+        delay_scores[lag_index] = np.sqrt(np.mean(effects**2, axis=0))
+
+        n_trials_per_lag.append(int(np.sum(valid)))
+        n_locations_per_lag.append(int(np.sum(present)))
+        print(
+            f"[RAW] lag_index={lag_index}: n_trials={np.sum(valid)}, "
+            f"represented_locations={np.sum(present)}/{num_locs}"
+        )
+
+    metadata = {
+        "n_trials_per_lag": n_trials_per_lag,
+        "n_locations_per_lag": n_locations_per_lag,
+        "definition": "RMS of centred future-location-conditioned mean planning activity",
+    }
+    return delay_scores, metadata
+
+
+def glm_activity_to_delay_scores(
+    planning_activity: np.ndarray,
+    lag_locations: np.ndarray,
+    num_locs: int,
+    glm_alpha: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Fit one joint categorical encoding GLM across all lags and all units.
+
+    Design:
+        planning activity ~ intercept + C(location_lag0) + ... + C(location_lagK)
+
+    Location 0 is the reference category within every lag block. After fitting,
+    category effects are reconstructed, centred across locations, and converted
+    to an RMS magnitude for every lag and unit. The resulting score is therefore
+    invariant to the arbitrary reference-category intercept.
+
+    glm_alpha=0 gives ordinary least squares. glm_alpha>0 gives ridge-stabilised
+    least squares, with the intercept left unpenalised.
+    """
+    if glm_alpha < 0:
+        raise ValueError("--glm_alpha must be >= 0.")
+
+    valid = (
+        np.all(np.isfinite(planning_activity), axis=1)
+        & np.all(np.isfinite(lag_locations), axis=1)
+    )
+    y = planning_activity[valid]
+    locations = lag_locations[valid].astype(int)
+
+    if y.shape[0] == 0:
+        raise ValueError("No complete trials remain for the joint all-lag GLM.")
+    if np.any(locations < 0) or np.any(locations >= num_locs):
+        raise ValueError("GLM location labels fall outside the inferred location range.")
+
+    blocks: list[np.ndarray] = []
+    block_slices: list[slice] = []
+    column_start = 1  # column zero is the intercept
+
+    for lag_index in range(locations.shape[1]):
+        block = np.column_stack(
+            [(locations[:, lag_index] == location).astype(float)
+             for location in range(1, num_locs)]
+        )
+        blocks.append(block)
+        block_slices.append(slice(column_start, column_start + block.shape[1]))
+        column_start += block.shape[1]
+
+    design = np.column_stack([np.ones(y.shape[0]), *blocks])
+    rank = int(np.linalg.matrix_rank(design))
+    singular_values = np.linalg.svd(design, compute_uv=False)
+    smallest = float(singular_values[-1]) if singular_values.size else np.nan
+    condition_number = (
+        float(singular_values[0] / smallest)
+        if singular_values.size and smallest > np.finfo(float).eps
+        else float("inf")
+    )
+
+    if glm_alpha == 0:
+        coefficients, _residuals, _rank, _singular = np.linalg.lstsq(design, y, rcond=None)
+        fit_name = "ordinary least squares"
+    else:
+        penalty = np.eye(design.shape[1], dtype=float)
+        penalty[0, 0] = 0.0  # do not penalise intercept
+        coefficients = np.linalg.solve(
+            design.T @ design + glm_alpha * penalty,
+            design.T @ y,
+        )
+        fit_name = f"ridge-stabilised least squares (alpha={glm_alpha:g})"
+
+    n_lags = locations.shape[1]
+    n_units = y.shape[1]
+    delay_scores = np.zeros((n_lags, n_units), dtype=float)
+
+    for lag_index, block_slice in enumerate(block_slices):
+        # Reference category effect is zero before centring.
+        category_effects = np.vstack(
+            [np.zeros((1, n_units), dtype=float), coefficients[block_slice]]
+        )
+        category_effects -= np.mean(category_effects, axis=0, keepdims=True)
+        delay_scores[lag_index] = np.sqrt(np.mean(category_effects**2, axis=0))
+
+    print(f"[GLM] Complete trials used: {y.shape[0]}")
+    print(f"[GLM] Design shape: {design.shape}; rank={rank}/{design.shape[1]}")
+    print(f"[GLM] Condition number: {condition_number:.4g}")
+    print(f"[GLM] Fit: {fit_name}")
+    if rank < design.shape[1] and glm_alpha == 0:
+        print(
+            "[WARN] GLM design is rank-deficient. OLS used the minimum-norm "
+            "solution. Re-run with --glm_alpha > 0 as a sensitivity analysis."
+        )
+
+    metadata = {
+        "n_complete_trials": int(y.shape[0]),
+        "design_rows": int(design.shape[0]),
+        "design_columns": int(design.shape[1]),
+        "design_rank": rank,
+        "condition_number": condition_number,
+        "glm_alpha": float(glm_alpha),
+        "definition": "RMS centred categorical location effect from one joint all-lag GLM",
+    }
+    return delay_scores, metadata
+
+
+def make_activity_delay_scores(
+    trial_data_path: Path,
+    n_units: int,
+    score_source: str,
+    planning_times: list[int],
+    lag_times: list[int] | None,
+    activity_standardization: str,
+    glm_alpha: float,
+) -> tuple[np.ndarray, list[int], dict[str, Any]]:
+    trial_data = load_trial_data(trial_data_path, n_units=n_units)
+    planning_activity, lag_locations, actual_lag_times, num_locs = prepare_activity_lag_data(
+        trial_data=trial_data,
+        planning_times=planning_times,
+        lag_times=lag_times,
+        activity_standardization=activity_standardization,
+    )
+
+    if score_source == "raw_activity":
+        delay_scores, metadata = raw_activity_to_delay_scores(
+            planning_activity=planning_activity,
+            lag_locations=lag_locations,
+            num_locs=num_locs,
+        )
+    elif score_source == "glm":
+        delay_scores, metadata = glm_activity_to_delay_scores(
+            planning_activity=planning_activity,
+            lag_locations=lag_locations,
+            num_locs=num_locs,
+            glm_alpha=glm_alpha,
+        )
+    else:
+        raise ValueError(f"Unsupported activity score source: {score_source}")
+
+    metadata.update(
+        {
+            "trial_data_path": str(trial_data_path),
+            "planning_times": list(planning_times),
+            "lag_times": list(actual_lag_times),
+            "activity_standardization": activity_standardization,
+            "num_locs": int(num_locs),
+        }
+    )
+    return delay_scores, actual_lag_times, metadata
 
 
 def parse_cluster_threshold(value: str | float | int) -> str | float:
@@ -765,6 +1183,78 @@ def extract_all_points(
     return rows
 
 
+def fragmentation_rows(
+    delay_scores: np.ndarray,
+    delay_labels: list[str],
+    adjacency: list[set[int]],
+    cluster_threshold: str | float,
+    score_source: str,
+) -> list[dict[str, Any]]:
+    """Summarise spatial fragmentation of every thresholded lag map."""
+    rows: list[dict[str, Any]] = []
+
+    for delay_index, score_map in enumerate(delay_scores):
+        binary, actual_threshold = threshold_score_map(score_map, cluster_threshold)
+        components = connected_components(binary, adjacency)
+        components = sorted(
+            components,
+            key=lambda comp: float(np.nansum(score_map[comp])),
+            reverse=True,
+        )
+        component_sizes = np.asarray([len(comp) for comp in components], dtype=int)
+
+        n_selected = int(np.sum(binary))
+        n_clusters = int(len(components))
+        largest_size = int(component_sizes.max()) if component_sizes.size else 0
+        n_singletons = int(np.sum(component_sizes == 1)) if component_sizes.size else 0
+
+        rows.append(
+            {
+                "score_source": score_source,
+                "delay_index": delay_index,
+                "delay_label": delay_labels[delay_index],
+                "cluster_threshold": actual_threshold,
+                "n_selected_units": n_selected,
+                "n_clusters": n_clusters,
+                "largest_cluster_size": largest_size,
+                "largest_cluster_fraction": (
+                    largest_size / n_selected if n_selected else np.nan
+                ),
+                "n_singleton_clusters": n_singletons,
+                "singleton_unit_fraction": (
+                    n_singletons / n_selected if n_selected else np.nan
+                ),
+                "mean_cluster_size": (
+                    float(np.mean(component_sizes)) if component_sizes.size else np.nan
+                ),
+                "median_cluster_size": (
+                    float(np.median(component_sizes)) if component_sizes.size else np.nan
+                ),
+                "cluster_sizes": ";".join(map(str, component_sizes.tolist())),
+            }
+        )
+
+    return rows
+
+
+def print_fragmentation_summary(rows: list[dict[str, Any]]) -> None:
+    print(
+        "\nlag | selected | clusters | largest | largest fraction | "
+        "singletons | singleton fraction"
+    )
+    print("-" * 86)
+    for row in rows:
+        print(
+            f"{str(row['delay_label']):>3s} | "
+            f"{int(row['n_selected_units']):8d} | "
+            f"{int(row['n_clusters']):8d} | "
+            f"{int(row['largest_cluster_size']):7d} | "
+            f"{float(row['largest_cluster_fraction']):16.3f} | "
+            f"{int(row['n_singleton_clusters']):10d} | "
+            f"{float(row['singleton_unit_fraction']):18.3f}"
+        )
+
+
 def rows_to_projection(rows: list[dict[str, Any]], mode: str, cluster_rank: int, axis: str) -> tuple[list[str], np.ndarray]:
     selected = [
         r for r in rows
@@ -868,6 +1358,17 @@ def main() -> None:
         description="fMRI-analogous peak/cluster/COM coordinate analysis for model units."
     )
     parser.add_argument("model", help="Model path, e.g. MazeEnv.../model0 or models/MazeEnv.../model0.p")
+    parser.add_argument(
+        "--score_source",
+        default="subspace",
+        choices=SCORE_SOURCES,
+        help=(
+            "Source of lag-specific unit maps. 'subspace' retains the existing "
+            "planning-subspace analysis; 'raw_activity' uses RMS variation "
+            "of location-conditioned planning activity; 'glm' uses partial effects "
+            "from one joint all-lag categorical GLM. Default: subspace."
+        ),
+    )
     parser.add_argument("--repo_root", default=".", help="Repository root. Default: current directory.")
     parser.add_argument("--axis", default="z", choices=["x", "y", "z"], help="Coordinate axis to analyse. Default: z.")
     parser.add_argument(
@@ -885,7 +1386,42 @@ def main() -> None:
     parser.add_argument(
         "--delay_labels",
         default=None,
-        help="Optional comma-separated labels for delays, e.g. 1,2,3,4,5.",
+        help="Optional comma-separated display labels for lags, e.g. 0,1,2,3,4,5.",
+    )
+    parser.add_argument(
+        "--planning_times",
+        default="-2,-1",
+        help=(
+            "Comma-separated planning step_nums to average for raw_activity/glm. "
+            "Default: -2,-1. Ignored for subspace."
+        ),
+    )
+    parser.add_argument(
+        "--lag_times",
+        default=None,
+        help=(
+            "Comma-separated non-negative step_nums to analyse for raw_activity/glm, "
+            "e.g. 0,1,2,3,4,5. Default: all available non-negative integer steps. "
+            "Ignored for subspace."
+        ),
+    )
+    parser.add_argument(
+        "--activity_standardization",
+        default="none",
+        choices=["none", "zscore"],
+        help=(
+            "Optional per-unit z-scoring across trials before raw_activity/glm. "
+            "Default: none (closer to an activity-amplitude/beta map)."
+        ),
+    )
+    parser.add_argument(
+        "--glm_alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "Ridge strength for the joint categorical GLM. 0 gives ordinary least "
+            "squares; values >0 provide a collinearity sensitivity analysis. Default: 0."
+        ),
     )
 
     parser.add_argument(
@@ -917,6 +1453,7 @@ def main() -> None:
     print(f"n_units:        {n_units}")
     print(f"embedding_name: {embedding_name}")
     print(f"axis:           {args.axis}")
+    print(f"score_source:   {args.score_source}")
     print("coordinate note: fsLR/Conte69 surface xyz coordinates; not labelled as MNI")
     print("anchor note:     no anchor/geodesic-distance analysis is performed here")
 
@@ -931,13 +1468,53 @@ def main() -> None:
     n_isolated = sum(len(x) == 0 for x in adjacency)
     print(f"[INFO] Surface-unit graph: {n_units} units, {n_edges} edges, {n_isolated} isolated units")
 
-    # Load delay-wise score maps.
-    ps_path = find_planning_subspaces_pickle(analysis_dir)
-    print(f"[INFO] Loaded planning subspaces from: {ps_path}")
-    csubs, csubs_key = load_csubs(ps_path, n_units)
-    print(f"[INFO] Using subspace array: {csubs_key}")
-    delay_scores = csubs_to_delay_scores(csubs, n_units=n_units, delay_axis=args.delay_axis)
-    delay_labels = parse_delay_labels(args.delay_labels, n_delays=delay_scores.shape[0])
+    # Choose only the source of the lag-specific unit maps. The entire
+    # threshold -> connected-cluster -> peak/COM -> coordinate pipeline below
+    # is shared across all score sources.
+    score_metadata: dict[str, Any] = {}
+
+    if args.score_source == "subspace":
+        ps_path = find_planning_subspaces_pickle(analysis_dir)
+        print(f"[INFO] Loaded planning subspaces from: {ps_path}")
+        csubs, csubs_key = load_csubs(ps_path, n_units)
+        print(f"[INFO] Using subspace array: {csubs_key}")
+        delay_scores = csubs_to_delay_scores(
+            csubs,
+            n_units=n_units,
+            delay_axis=args.delay_axis,
+        )
+        actual_lag_times = list(range(delay_scores.shape[0]))
+        score_metadata = {
+            "planning_subspaces_path": str(ps_path),
+            "subspace_array_key": csubs_key,
+            "definition": "norm of planning-subspace coefficients over locations",
+        }
+    else:
+        planning_times = parse_int_list(args.planning_times, "--planning_times")
+        if planning_times is None:
+            raise ValueError("--planning_times must contain at least one time.")
+        requested_lag_times = parse_int_list(args.lag_times, "--lag_times")
+
+        trial_data_path = find_trial_data_pickle(analysis_dir)
+        print(f"[INFO] Loaded trial data from: {trial_data_path}")
+        delay_scores, actual_lag_times, score_metadata = make_activity_delay_scores(
+            trial_data_path=trial_data_path,
+            n_units=n_units,
+            score_source=args.score_source,
+            planning_times=planning_times,
+            lag_times=requested_lag_times,
+            activity_standardization=args.activity_standardization,
+            glm_alpha=args.glm_alpha,
+        )
+
+    print(f"[INFO] Final delay_scores shape: {delay_scores.shape}")
+    if args.delay_labels is None:
+        delay_labels = [str(value) for value in actual_lag_times]
+    else:
+        delay_labels = parse_delay_labels(
+            args.delay_labels,
+            n_delays=delay_scores.shape[0],
+        )
 
     cluster_threshold = parse_cluster_threshold(args.cluster_threshold)
 
@@ -951,15 +1528,56 @@ def main() -> None:
         cluster_threshold=cluster_threshold,
         n_clusters=args.n_clusters,
     )
+    for row in rows:
+        row["score_source"] = args.score_source
+
+    frag_rows = fragmentation_rows(
+        delay_scores=delay_scores,
+        delay_labels=delay_labels,
+        adjacency=adjacency,
+        cluster_threshold=cluster_threshold,
+        score_source=args.score_source,
+    )
+    print_fragmentation_summary(frag_rows)
 
     threshold_tag = str(args.cluster_threshold).replace(".", "p")
-    out_dir = analysis_dir / "fmri_analogous" / f"fmri_axis-{args.axis}_thr-{threshold_tag}"
+    if args.score_source == "subspace":
+        # Preserve the original output location for backward compatibility.
+        output_name = f"fmri_axis-{args.axis}_thr-{threshold_tag}"
+    else:
+        output_name = (
+            f"fmri_score-{args.score_source}_axis-{args.axis}_thr-{threshold_tag}"
+        )
+    out_dir = analysis_dir / "fmri_analogous" / output_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = out_dir / "fmri_analogous_peak_cluster_com_coordinates.csv"
     write_csv(rows, csv_path)
+    write_csv(frag_rows, out_dir / "spatial_fragmentation.csv")
 
-    title_prefix = f"{embedding_name} | fMRI-analogous model analogue"
+    np.savez_compressed(
+        out_dir / "lag_score_maps.npz",
+        delay_scores=delay_scores,
+        delay_labels=np.asarray(delay_labels, dtype=object),
+        actual_lag_times=np.asarray(actual_lag_times, dtype=int),
+        score_source=np.asarray(args.score_source),
+    )
+    with open(out_dir / "score_source_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "score_source": args.score_source,
+                "score_source_label": SCORE_SOURCE_LABELS[args.score_source],
+                "score_metadata": score_metadata,
+                "delay_labels": delay_labels,
+                "actual_lag_times": actual_lag_times,
+                "cluster_threshold": cluster_threshold,
+            },
+            f,
+        )
+
+    title_prefix = (
+        f"{embedding_name} | {SCORE_SOURCE_LABELS[args.score_source]}"
+    )
     make_primary_plots(rows, out_dir, axis=args.axis, title_prefix=title_prefix)
 
     if bool(args.brain_plots):
@@ -973,6 +1591,7 @@ def main() -> None:
             bg_sulc=bg_sulc,
             unit_vertices=unit_vertices,
             out_dir=out_dir,
+            score_source_label=SCORE_SOURCE_LABELS[args.score_source],
         )
 
         plot_strongest_cluster_surface_qc(
@@ -985,11 +1604,13 @@ def main() -> None:
             adjacency=adjacency,
             cluster_threshold=cluster_threshold,
             out_dir=out_dir,
+            score_source_label=SCORE_SOURCE_LABELS[args.score_source],
         )
 
-        print("\nDONE")
-        print(f"Outputs saved in: {out_dir}")
-        print(f"Main CSV: {csv_path}")
+    print("\nDONE")
+    print(f"Outputs saved in: {out_dir}")
+    print(f"Main CSV: {csv_path}")
+    print(f"Fragmentation CSV: {out_dir / 'spatial_fragmentation.csv'}")
 
 
 if __name__ == "__main__":
