@@ -1,6 +1,38 @@
 import argparse
 
 
+TASK_DEFAULTS = {
+    "maze": {
+        "model_type": "corticallyembedded",
+        "Nrec": 347,
+        "batch_size": 200,
+        "embedding_name": "mpfc_union_gradient_nearest_a24_25_anchor25",
+        "embedding_species": "human",
+        "embedding_seed": 42,
+    },
+    "abcd_fmri": {
+        "model_type": "corticallyembedded",
+        "Nrec": 480,
+        "batch_size": 8,
+        "embedding_name": "mpfc_projected_mask_linear0p1",
+        "embedding_species": "human",
+        "embedding_seed": 42,
+    },
+}
+
+
+def apply_task_defaults(parameters):
+    """Return a copy with task-conditioned model/batch defaults filled."""
+    parameters = dict(parameters)
+    task = parameters.get("task", "maze")
+    if task not in TASK_DEFAULTS:
+        raise ValueError(f"Unknown task: {task}")
+    for key, value in TASK_DEFAULTS[task].items():
+        if parameters.get(key) is None:
+            parameters[key] = value
+    return parameters
+
+
 def parse_args(**kwargs):
     """
     Parameters
@@ -10,6 +42,15 @@ def parse_args(**kwargs):
     """
     
     parser = argparse.ArgumentParser()
+
+    # task selection. Keep MazeEnv as the default so existing Jensen commands
+    # continue to construct exactly the same task.
+    parser.add_argument(
+        '--task',
+        choices=['maze', 'abcd_fmri'],
+        default='maze',
+        help="behavioural task to train: Jensen's maze or the ABCD fMRI task",
+    )
 
     # environment args
     parser.add_argument('--side_length', type=int, default=4, help="of arena")
@@ -26,7 +67,9 @@ def parse_args(**kwargs):
     parser.add_argument('--inp_noise_planning', type=float, default=1e-3, help="noise fraction during the planning period")
 
     # model args
-    parser.add_argument('--Nrec', type=int, default=347, help="number of hidden units")
+    # These task-dependent defaults are filled after command-line and
+    # programmatic overrides have both been applied (see below).
+    parser.add_argument('--Nrec', type=int, default=None, help="number of hidden units")
     parser.add_argument('--nonlin_output', default=0, type=int, help="if true, include a hidden layer in the output function from the RNN")
     parser.add_argument('--r_reg', type=float, default=1e-5, help="rate regularization strength")
     parser.add_argument('--W_reg', type=float, default=2e-7, help="weight regularization strength")
@@ -39,7 +82,7 @@ def parse_args(**kwargs):
     # mini-CERNN args
     parser.add_argument(
         '--model_type',
-        default="corticallyembedded",
+        default=None,
         type=str,
         help="vanilla, lineembedded, or corticallyembedded",
     )
@@ -58,12 +101,12 @@ def parse_args(**kwargs):
     # cortical embedding options
     parser.add_argument(
         '--embedding_name',
-        default='mpfc_union_gradient_nearest_a24_25_anchor25',
+        default=None,
         type=str,
         help="name of saved cortical embedding roi",
     )
-    parser.add_argument('--embedding_species', default='human', type=str, help="species folder for saved embedding")
-    parser.add_argument('--embedding_seed', default=42, type=int, help="seed used when generating the saved embedding")
+    parser.add_argument('--embedding_species', default=None, type=str, help="species folder for saved embedding")
+    parser.add_argument('--embedding_seed', default=None, type=int, help="seed used when generating the saved embedding")
     parser.add_argument(
         '--anchor_area_names',
         nargs="+",
@@ -83,7 +126,7 @@ def parse_args(**kwargs):
     )
 
     # training args
-    parser.add_argument('--batch_size', type=int, default=200, help="batch size for the environment")
+    parser.add_argument('--batch_size', type=int, default=None, help="batch size (task-dependent default: maze=200, abcd_fmri=8)")
     parser.add_argument('--seed', type=int, default=0, help="random seed")
     parser.add_argument('--overwrite', default=0, type=int, help="allow overwrite of existing model of the same name")
     parser.add_argument('--eval_freq', type=int, default=200, help="number of batches between each instance of evaluation and model saving")
@@ -93,11 +136,40 @@ def parse_args(**kwargs):
     parser.add_argument('--lrate', type=float, default=3e-4, help="ADAM learning rate")
     parser.add_argument('--save_results', type=int, default=1, help="whether to save the model")
 
+    # ABCD fMRI-task arguments. They are harmless extras for MazeEnv, whose
+    # constructor already accepts unused keyword arguments. Configuration
+    # strings encode ordered location IDs separated by semicolons; parsing the
+    # task-level structure is delegated to pysta.tasks / pysta.abcd_env.
+    parser.add_argument('--n_loops', type=int, default=None, help="number of instruction/execution loops in an ABCD block")
+    parser.add_argument('--instruction_repeats', type=int, default=None, help="number of presentations of each ABCD instruction")
+    parser.add_argument('--configuration_seed', type=int, default=0, help="base seed used when task-specific configuration seeds are omitted")
+    parser.add_argument('--train_configuration_seed', type=int, default=None, help="seed for generating the ABCD training configuration bank")
+    parser.add_argument('--eval_configuration_seed', type=int, default=None, help="seed for generating the held-out ABCD evaluation configuration bank")
+    parser.add_argument('--train_configurations', type=str, default=None, help="explicit semicolon-separated ordered ABCD training configurations")
+    parser.add_argument('--eval_configurations', type=str, default=None, help="explicit semicolon-separated ordered ABCD evaluation configurations")
+    parser.add_argument('--num_train_configurations', type=int, default=None, help="number of generated ABCD training configurations")
+    parser.add_argument('--num_eval_configurations', type=int, default=None, help="number of generated held-out ABCD evaluation configurations")
+    parser.add_argument('--train_task_seed', type=int, default=None, help="RNG seed for sampling ABCD training blocks")
+    parser.add_argument('--eval_task_seed', type=int, default=None, help="RNG seed for sampling held-out ABCD evaluation blocks")
+    parser.add_argument(
+        '--start_position_policy',
+        choices=['exclude_first_goal', 'uniform', 'fixed'],
+        default=None,
+        help="ABCD non-target start policy; fixed also requires --start_position",
+    )
+    parser.add_argument('--start_position', type=int, default=None, help="fixed ABCD start location ID")
+    parser.add_argument('--max_navigation_steps', type=int, default=None, help="maximum ABCD navigation actions in one block")
+    parser.add_argument('--instruction_directions', nargs='+', type=str, default=None, help="allowed ABCD instruction directions")
+    parser.add_argument('--execution_relations', nargs='+', type=str, default=None, help="allowed ABCD execution relations")
+    parser.add_argument('--min_goal_distance', type=int, default=None, help="minimum circular consecutive-goal Manhattan distance")
+
     # parse command line arguments
     parameters = vars(parser.parse_args())
 
     for key, value in kwargs.items():
         parameters[key] = value
+
+    parameters = apply_task_defaults(parameters)
         
     bool_parameters = [
         "changing_trial_maze",

@@ -12,6 +12,11 @@ basedir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 def reload():
     importlib.reload(pysta)
     importlib.reload(pysta.envs)
+    if hasattr(pysta, "abcd_env"):
+        importlib.reload(pysta.abcd_env)
+    if hasattr(pysta, "abcd_analysis_utils"):
+        importlib.reload(pysta.abcd_analysis_utils)
+    importlib.reload(pysta.tasks)
     importlib.reload(pysta.agents)
     importlib.reload(pysta.maze_utils)
     importlib.reload(pysta.utils)
@@ -77,7 +82,8 @@ for barrier in schematic_barriers: schematic_walls[barrier[0], barrier[1]] = 1.0
 def get_rnn_name(kwargs):
 
     # instantiate env and agent to generate name
-    env = pysta.envs.MazeEnv(**kwargs)
+    kwargs = pysta.argparser.apply_task_defaults(kwargs)
+    env = pysta.tasks.make_environment(kwargs, split="train")
 
     model_type = kwargs.get("model_type", "vanilla")
     if model_type == "vanilla":
@@ -192,6 +198,3 @@ def compute_model_support(results):
                             res[int(cond((ta1, ta2), (tb1, tb2)))].append(perf)
         all_res.append([np.mean(res[i]) for i in range(2)])
     return all_res
-    
-    
-    

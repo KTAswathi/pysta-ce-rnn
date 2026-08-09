@@ -6,6 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
+from collections.abc import Mapping
 from pathlib import Path
 from pysta.embedding.mpfc_embedding import load_embedding
 
@@ -112,13 +113,106 @@ class BaseAgent(nn.Module):
         self.r = self.phi(self.z)
         
         # instantiate loss functions
-        self.acc_loss = torch.tensor(0.0) # accuracy
+        self.acc_loss = torch.tensor(0.0, device=self.z0.device) # accuracy
         self.weight_loss = self.env.batch * self.calc_parameter_reg() # parameter regularization
         self.rate_loss = self.calc_activity_reg() # rate regularization
-        self.ent_loss = torch.tensor(0.0) # entropy regularization
+        self.ent_loss = torch.tensor(0.0, device=self.z0.device) # entropy regularization
         self.update_optimal_actions() # cache optimal actions
         
         return
+
+    def _as_batch_mask(self, mask, name, device):
+        """Convert an environment mask to a boolean tensor of shape ``(batch,)``."""
+        mask = torch.as_tensor(mask, dtype=torch.bool, device=device)
+        if mask.ndim == 0:
+            mask = mask.expand(self.env.batch)
+        if tuple(mask.shape) != (self.env.batch,):
+            raise ValueError(
+                f"{name} must have shape ({self.env.batch},), got {tuple(mask.shape)}."
+            )
+        return mask
+
+    def _policy_loss_mask(self, device=None):
+        """Return the trials whose current action contributes to policy metrics/loss."""
+        device = self.z0.device if device is None else device
+        policy_loss_mask = getattr(self.env, "policy_loss_mask", None)
+        if callable(policy_loss_mask):
+            return self._as_batch_mask(
+                policy_loss_mask(), "env.policy_loss_mask()", device
+            )
+
+        # Jensen MazeEnv fallback: execution phase and unfinished trials only.
+        not_finished = self._as_batch_mask(
+            ~torch.as_tensor(self.env.finished, dtype=torch.bool),
+            "~env.finished",
+            device,
+        )
+        step_num = torch.as_tensor(self.env.step_num, device=device)
+        execution_phase = self._as_batch_mask(
+            step_num >= 0, "env.step_num >= 0", device
+        )
+        return execution_phase & not_finished
+
+    def _action_sampling_mask(self, device, dtype):
+        """Return an optional per-trial mask over actions available for sampling."""
+        action_sampling_mask = getattr(self.env, "action_sampling_mask", None)
+        if callable(action_sampling_mask):
+            mask = action_sampling_mask()
+            if mask is None:
+                return None
+        elif getattr(self.env, "output_format", None) == "allocentric":
+            # Jensen MazeEnv fallback: allocentric outputs denote destination states,
+            # so only adjacent states may be sampled.
+            mask = self.env.adjacency[
+                self.env.batch_inds, self.env.loc, :
+            ]
+            assert mask.sum(-1).min() >= 2
+        else:
+            # Jensen egocentric policies already enumerate valid actions.
+            return None
+
+        mask = torch.as_tensor(mask, dtype=dtype, device=device)
+        if mask.ndim == 1 and tuple(mask.shape) == (self.Nout,):
+            mask = mask[None, :].expand(self.env.batch, -1)
+        if tuple(mask.shape) != (self.env.batch, self.Nout):
+            raise ValueError(
+                "env.action_sampling_mask() must have shape "
+                f"({self.env.batch}, {self.Nout}), got {tuple(mask.shape)}."
+            )
+        if not torch.isfinite(mask).all() or torch.any(mask < 0):
+            raise ValueError("Action-sampling masks must be finite and non-negative.")
+        return mask
+
+    @staticmethod
+    def _snapshot_value(value):
+        """Copy mutable environment metadata before the environment advances again."""
+        if torch.is_tensor(value):
+            return value.detach().clone()
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        if isinstance(value, Mapping):
+            return {
+                key: BaseAgent._snapshot_value(item) for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [BaseAgent._snapshot_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(BaseAgent._snapshot_value(item) for item in value)
+        return value
+
+    def _environment_metadata(self, hook_name):
+        """Read and snapshot optional environment-specific trajectory metadata."""
+        hook = getattr(self.env, hook_name, None)
+        if not callable(hook):
+            return {}
+        metadata = hook()
+        if metadata is None:
+            return {}
+        if not isinstance(metadata, Mapping):
+            raise TypeError(f"env.{hook_name}() must return a mapping or None.")
+        return {
+            key: self._snapshot_value(value) for key, value in metadata.items()
+        }
     
     def sample_action(self):
         """
@@ -135,13 +229,26 @@ class BaseAgent(nn.Module):
         """
         
         with torch.no_grad():
-            if self.env.output_format == "allocentric":
-                adj = self.env.adjacency[self.env.batch_inds, self.env.loc, :] # renormalize over adjacent states
-                assert adj.sum(-1).min() >= 2 # we should always have adjacent states
-                pi = (self.pi+1e-20) * adj # add some jitter to make sure the policy is not exactly zero. Otherwise we sometimes run into nans
-                pi = pi/pi.sum(-1, keepdims = True) # normalise
-            else:
-                pi = self.pi # if we're already in egocentric space, everything is possible
+            pi = self.pi
+            sampling_mask = self._action_sampling_mask(pi.device, pi.dtype)
+            active = self._policy_loss_mask(pi.device)
+
+            if sampling_mask is not None:
+                # Add jitter only to permitted actions. Rows outside the policy-loss
+                # phase may legitimately expose an empty mask because their action is
+                # ignored; retain the unconstrained policy for those rows so sampling
+                # remains numerically defined.
+                masked_pi = (pi + 1e-20) * sampling_mask
+                normalizer = masked_pi.sum(-1, keepdim=True)
+                valid_rows = normalizer[..., 0] > 0
+                if torch.any(active & ~valid_rows):
+                    raise ValueError(
+                        "env.action_sampling_mask() permits no actions for an active trial."
+                    )
+                normalized_masked_pi = masked_pi / normalizer.clamp_min(
+                    torch.finfo(pi.dtype).tiny
+                )
+                pi = torch.where(valid_rows[:, None], normalized_masked_pi, pi)
                 
             if self.greedy: # pick the most likely action
                 self.action = torch.argmax(pi, -1)
@@ -153,17 +260,39 @@ class BaseAgent(nn.Module):
                     # This may happen if the policy becomes near-deterministic, and it can often be resolved by increasing the entropy regularisation.
                     print(pi.min(), pi.max(), self.pi.min(), self.pi.max(), self.logpi.min(), self.logpi.max())
                     pickle.dump(self, open("./temp.p", "wb"))
-                    raise Error
+                    raise
                 
-            if self.force_optimal: # optionally renormalize over optimal actions first
-                # add small epsilon in case there are no optimal actions -> uniform policy (e.g. if the goal is too far away to be reached within the trial)
-                opt_pis = pi * self.optimal_actions + torch.rand(pi.shape)*1e-20
+            # Outside the policy-loss phase the environment ignores the action. Start
+            # from the unconstrained sample, then enforce optimality only for active rows.
+            self.env_action = self.action.clone()
+            teacher_rows = active
+            if not callable(getattr(self.env, "policy_loss_mask", None)):
+                # Exact Jensen fallback: the old agent teacher-forced every row,
+                # including planning/finished rows whose actions were ignored.
+                teacher_rows = torch.ones_like(active)
+            if self.force_optimal and torch.any(teacher_rows):
+                optimal_actions = torch.as_tensor(
+                    self.optimal_actions, dtype=pi.dtype, device=pi.device
+                )
+                if tuple(optimal_actions.shape) != tuple(pi.shape):
+                    raise ValueError(
+                        "env.optimal_actions() must have shape "
+                        f"{tuple(pi.shape)}, got {tuple(optimal_actions.shape)}."
+                    )
+
+                opt_pis = pi[teacher_rows] * optimal_actions[teacher_rows]
+                jitter = torch.rand_like(opt_pis) * 1e-20
+                if sampling_mask is not None:
+                    jitter = jitter * (sampling_mask[teacher_rows] > 0).to(pi.dtype)
+                opt_pis = opt_pis + jitter
+
+                if torch.any(opt_pis.sum(-1) <= 0):
+                    raise ValueError("No optimal action is available for an active trial.")
                 if self.greedy: # pick most likely action
-                    self.env_action = torch.argmax(opt_pis, -1)
+                    optimal_samples = torch.argmax(opt_pis, -1)
                 else: # sample an action
-                    self.env_action = torch.multinomial(opt_pis, 1)[..., 0]
-            else: # if we're not enforcing optimality, the action passed to environment is just the original action
-                self.env_action = self.action
+                    optimal_samples = torch.multinomial(opt_pis, 1)[..., 0]
+                self.env_action[teacher_rows] = optimal_samples
             
         return self.action
     
@@ -197,57 +326,99 @@ class BaseAgent(nn.Module):
         """
         return 0.0
 
-    def update_loss(self):
+    def update_loss(self, loss_mask=None):
         """
         Accumulate losses.
         Treat accuracy loss, rate loss, and parameter loss separately.
         Losses are only added for trials that have not finished.
         """
         
-        not_finished = torch.where(~self.env.finished)[0] # trials that have not finished 
-        
-        if self.env.step_num >= 0: # only apply prediction and parameter loss during execution phase
-            
+        loss_mask = (
+            self._policy_loss_mask(self.pi.device)
+            if loss_mask is None
+            else self._as_batch_mask(loss_mask, "loss_mask", self.pi.device)
+        )
+
+        if torch.any(loss_mask):
             # policy loss (sum_{a \in opt_as} pi(a))
-            opt_probs = (self.pi*self.optimal_actions)[not_finished, :].sum(-1)
+            optimal_actions = torch.as_tensor(
+                self.optimal_actions, dtype=self.pi.dtype, device=self.pi.device
+            )
+            opt_probs = (self.pi * optimal_actions)[loss_mask, :].sum(-1)
             assert opt_probs.max() < 1.0 + 1e-5 # check that things are not too crazy
             self.acc_loss = self.acc_loss + (1.0 - opt_probs).sum() # turn our objective into a loss and sum across batches
             
             # entropy loss
             jitter = 1e-5 # add a little bit of jitter to avoid nans
             pi_ent = (self.pi + jitter) / (1+self.pi.shape[-1] * jitter) # make sure things are normalised
-            self.ent_loss = self.ent_loss + self.ent_reg * (pi_ent*pi_ent.log())[not_finished, :].sum() # want to maximize entropy; minimize -H = E[pi logpi]
+            self.ent_loss = self.ent_loss + self.ent_reg * (pi_ent*pi_ent.log())[loss_mask, :].sum() # want to maximize entropy; minimize -H = E[pi logpi]
     
         return
     
-    def update_store(self):
+    def update_store(self, loss_mask=None, observation=None):
         """
         Update list of environment/agent states to include the current state.
         """
         
-        corrects = self.optimal_actions[self.env.batch_inds, self.action] # was the action correct for each trial?
-        corrects[self.env.finished] = torch.nan # nans if trial is finished
+        loss_mask = (
+            self._policy_loss_mask(self.action.device)
+            if loss_mask is None
+            else self._as_batch_mask(loss_mask, "loss_mask", self.action.device)
+        )
+        optimal_actions = torch.as_tensor(
+            self.optimal_actions, dtype=self.pi.dtype, device=self.action.device
+        )
+        batch_inds = torch.arange(self.env.batch, device=self.action.device)
+        corrects = optimal_actions[batch_inds, self.action].clone()
+        if callable(getattr(self.env, "policy_loss_mask", None)):
+            corrects[~loss_mask] = torch.nan
+        else:
+            # Preserve Jensen's stored planning correctness values; only
+            # already-finished trials were NaN in the original store format.
+            finished = self._as_batch_mask(
+                self.env.finished, "env.finished", self.action.device
+            )
+            corrects[finished] = torch.nan
+        if observation is None:
+            observation = self.env.observation().to(self.z0.device)
 
-        self.store.append({
-        "rs": self.r.detach(), # firing rate
-        "zs": self.z.detach(), # neural potential
-        "loc": self.env.loc, # location
-        "action": self.action, # action generated by the agent
-        "env_action": self.env_action, # action passed to the environment
-        "optimal_actions": self.optimal_actions, # optimal action
-        "step_num": self.env.step_num, # how far along are we in the trial (negative during the planning phase)
-        "finished": self.env.finished.clone(), # which trials have finished
-        "pi": self.pi.detach(), # policy
-        "xs": self.env.observation(), # inputs
-        "corrects" : corrects # whether actions are correct
-        })
+        record = {
+            "rs": self.r.detach(), # firing rate
+            "zs": self.z.detach(), # neural potential
+            "action": self.action, # action generated by the agent
+            "env_action": self.env_action, # action passed to the environment
+            "optimal_actions": self.optimal_actions, # optimal action
+            "finished": self._snapshot_value(self.env.finished), # which trials have finished
+            "loss_mask": loss_mask.detach().clone(), # which actions contribute to policy loss/accuracy
+            "pi": self.pi.detach(), # policy
+            "xs": observation.detach(), # exact inputs used for this RNN/environment step
+            "corrects": corrects, # whether actions are correct
+        }
+
+        # Keep Jensen's established fields when the environment exposes them,
+        # without requiring them from generic environments.
+        if hasattr(self.env, "loc"):
+            record["loc"] = self._snapshot_value(self.env.loc)
+        if hasattr(self.env, "step_num"):
+            record["step_num"] = self._snapshot_value(self.env.step_num)
+
+        record.update(self._environment_metadata("trajectory_metadata"))
+        self.store.append(record)
+
+    def update_post_step_store(self):
+        """Attach optional post-transition metadata to the most recent record."""
+        if len(self.store) == 0:
+            return
+        self.store[-1].update(self._environment_metadata("post_step_metadata"))
         
     def update_optimal_actions(self):
         """
         Cache optimal actions
         """
         with torch.no_grad():
-            self.optimal_actions = self.env.optimal_actions() # tensor (batch, output_dim)
+            self.optimal_actions = torch.as_tensor(
+                self.env.optimal_actions(), dtype=self.z0.dtype, device=self.z0.device
+            ) # tensor (batch, output_dim)
 
     def forward(self, store = False):
         """
@@ -271,13 +442,16 @@ class BaseAgent(nn.Module):
             
             x = self.env.observation().to(self.z0.device) # observation at this point in time
             self.step(x) # update RNN state, compute policy, and sample an action
-            self.update_loss() # update performance and entropy loss 
+            loss_mask = self._policy_loss_mask(self.pi.device)
+            self.update_loss(loss_mask) # update performance and entropy loss
             
             # now update environment and optionally store env+agent state (don't propagate gradients through this)
             with torch.no_grad():
                 if store:
-                    self.update_store()
+                    self.update_store(loss_mask, observation=x)
                 self.env.step(self.env_action) # action passed to the environment (optionally restricted to be optimal)
+                if store:
+                    self.update_post_step_store()
         
         # loss is combined accuracy and regularization losses, normalized by the batch size
         return (self.acc_loss + self.weight_loss + self.rate_loss + self.ent_loss) / self.env.batch
@@ -303,8 +477,13 @@ class BaseAgent(nn.Module):
             # simulate the trials
             loss = self.forward(store = True).detach().cpu().numpy()
             losses.append(loss) # append loss
-            corrects = torch.stack([s["corrects"] for s in self.store if s["step_num"]>=0]) # accuracy for each trial and step in the execution phase
-            accs.append(torch.nanmean(corrects, axis = 0).mean()) # average
+            corrects = torch.stack([s["corrects"] for s in self.store])
+            loss_masks = torch.stack([s["loss_mask"] for s in self.store]).to(
+                device=corrects.device, dtype=torch.bool
+            )
+            corrects = corrects.masked_fill(~loss_masks, torch.nan)
+            per_trial_acc = torch.nanmean(corrects, dim=0)
+            accs.append(torch.nanmean(per_trial_acc).detach().cpu().item())
             
         return np.mean(losses), np.mean(accs)
             
@@ -607,33 +786,135 @@ class LineEmbeddedRNN(VanillaRNN):
     # helper: build input routing masks from env.obs_inds()
     def _build_input_masks(self):
         inds = self.env.obs_inds()
-        loc_inds = torch.as_tensor(inds["loc"], dtype=torch.long)
-        rew_inds = torch.as_tensor(inds["goal"], dtype=torch.long)
-        wall_inds = torch.as_tensor(inds["walls"], dtype=torch.long)
+        if not isinstance(inds, Mapping):
+            raise TypeError("env.obs_inds() must return a mapping of groups to indices.")
 
-        all_units = torch.arange(self.Nrec, dtype=torch.long)
-        same_end_units = torch.where(self.same_end_unit_mask > 0)[0]
+        routing_hook = getattr(self.env, "input_routing", None)
+        routing_hook_name = "input_routing"
+        if not callable(routing_hook):
+            routing_hook = getattr(self.env, "cortical_input_routing", None)
+            routing_hook_name = "cortical_input_routing"
 
-        # start with empty masks; we will fill only the relevant columns
-        mask_loc = torch.zeros(self.Nrec, self.Nin, dtype=torch.float32)
-        mask_rew = torch.zeros(self.Nrec, self.Nin, dtype=torch.float32)
-        mask_wall = torch.zeros(self.Nrec, self.Nin, dtype=torch.float32)
+        if callable(routing_hook):
+            routing = routing_hook()
+            if not isinstance(routing, Mapping):
+                raise TypeError(
+                    f"env.{routing_hook_name}() must return a mapping of groups to modes."
+                )
+            buffer_names = {group: f"mask_{group}" for group in inds}
+        else:
+            # Exact Jensen MazeEnv fallback, retaining its original flags and
+            # public buffer names for existing models and analyses.
+            expected_groups = {"loc", "goal", "walls"}
+            if set(inds) != expected_groups:
+                raise ValueError(
+                    "An environment without input_routing() or "
+                    "cortical_input_routing() must expose Jensen MazeEnv groups "
+                    f"{sorted(expected_groups)}, got {sorted(inds)}."
+                )
+            routing = {
+                "loc": "local" if self.localize_loc_input else "global",
+                "goal": "local" if self.localize_rew_input else "global",
+                "walls": "local" if self.localize_wall_input else "global",
+            }
+            buffer_names = {
+                "loc": "mask_loc",
+                "goal": "mask_rew",
+                "walls": "mask_wall",
+            }
 
-        # current-location channels
-        loc_target_units = same_end_units if self.localize_loc_input else all_units
-        mask_loc[loc_target_units[:, None], loc_inds[None, :]] = 1.0
+        if set(routing) != set(inds):
+            missing = sorted(set(inds) - set(routing))
+            extra = sorted(set(routing) - set(inds))
+            raise ValueError(
+                "Input-routing groups must exactly match env.obs_inds(); "
+                f"missing={missing}, extra={extra}."
+            )
 
-        # future-reward channels
-        rew_target_units = same_end_units if self.localize_rew_input else all_units
-        mask_rew[rew_target_units[:, None], rew_inds[None, :]] = 1.0
+        combined_mask = torch.zeros(self.Nrec, self.Nin, dtype=torch.float32)
+        covered_inputs = torch.zeros(self.Nin, dtype=torch.bool)
+        input_mask_buffers = {}
+        input_routing_modes = {}
 
-        # wall channels
-        wall_target_units = same_end_units if self.localize_wall_input else all_units
-        mask_wall[wall_target_units[:, None], wall_inds[None, :]] = 1.0
+        mode_aliases = {
+            "local": "same_end",
+            "same_end": "same_end",
+            "global": "global",
+            "opposite": "opposite_end",
+            "opposite_end": "opposite_end",
+        }
+        unit_masks = {
+            "same_end": self.same_end_unit_mask,
+            "global": torch.ones(self.Nrec, dtype=torch.float32),
+            "opposite_end": self.opposite_end_unit_mask,
+        }
 
-        self.register_buffer("mask_loc", mask_loc)
-        self.register_buffer("mask_rew", mask_rew)
-        self.register_buffer("mask_wall", mask_wall)
+        for group, group_inds in inds.items():
+            if not isinstance(group, str):
+                raise TypeError("env.obs_inds() group names must be strings.")
+
+            group_inds = torch.as_tensor(group_inds)
+            if group_inds.ndim != 1:
+                raise ValueError(
+                    f"Observation indices for group '{group}' must be one-dimensional."
+                )
+            if group_inds.dtype not in {
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            }:
+                raise TypeError(
+                    f"Observation indices for group '{group}' must be integers."
+                )
+            group_inds = group_inds.to(dtype=torch.long)
+            if group_inds.numel() != torch.unique(group_inds).numel():
+                raise ValueError(
+                    f"Observation group '{group}' contains duplicate indices."
+                )
+            if group_inds.numel() > 0 and (
+                torch.any(group_inds < 0) or torch.any(group_inds >= self.Nin)
+            ):
+                raise ValueError(
+                    f"Observation group '{group}' contains indices outside 0..{self.Nin - 1}."
+                )
+            if torch.any(covered_inputs[group_inds]):
+                raise ValueError(
+                    f"Observation group '{group}' overlaps another input group."
+                )
+
+            mode = routing[group]
+            if mode not in mode_aliases:
+                raise ValueError(
+                    f"Unknown routing mode '{mode}' for group '{group}'; expected "
+                    "'local'/'same_end', 'global', or 'opposite'/'opposite_end'."
+                )
+            normalized_mode = mode_aliases[mode]
+            group_mask = torch.zeros(self.Nrec, self.Nin, dtype=torch.float32)
+            group_mask[:, group_inds] = unit_masks[normalized_mode][:, None]
+
+            buffer_name = buffer_names[group]
+            if not buffer_name.isidentifier() or buffer_name == "mask_input":
+                raise ValueError(
+                    f"Observation group '{group}' cannot be registered as buffer '{buffer_name}'."
+                )
+            self.register_buffer(buffer_name, group_mask)
+            input_mask_buffers[group] = buffer_name
+            input_routing_modes[group] = normalized_mode
+            combined_mask = combined_mask + group_mask
+            covered_inputs[group_inds] = True
+
+        if not torch.all(covered_inputs):
+            missing_inputs = torch.where(~covered_inputs)[0].tolist()
+            raise ValueError(
+                "env.obs_inds() must cover every observation channel exactly once; "
+                f"missing indices={missing_inputs}."
+            )
+
+        self.input_mask_buffers = input_mask_buffers
+        self.input_routing_modes = input_routing_modes
+        self.register_buffer("mask_input", combined_mask)
 
     def initialise_weights(self):
         """
@@ -741,13 +1022,15 @@ class LineEmbeddedRNN(VanillaRNN):
         for _ in range(network_iters):
             rec_noise = torch.randn(batch, self.Nrec, 1, device=self.z0.device) * self.rec_noise
 
-            # split the input into separately routed components
+            # Apply the validated combined routing mask. Whole-object Jensen
+            # checkpoints created before generic routing have the three legacy
+            # masks but no ``mask_input`` buffer, so retain a read-only fallback.
             obs_col = observation[..., None]  # (batch, Nin, 1)
-
-            ff_loc = (self.Win * self.mask_loc) @ obs_col
-            ff_rew = (self.Win * self.mask_rew) @ obs_col
-            ff_wall = (self.Win * self.mask_wall) @ obs_col
-            ff_inp = ff_loc + ff_rew + ff_wall
+            if hasattr(self, "mask_input"):
+                input_mask = self.mask_input
+            else:
+                input_mask = self.mask_loc + self.mask_rew + self.mask_wall
+            ff_inp = (self.Win * input_mask) @ obs_col
 
             rec_inp = self.Wrec @ self.r
 
@@ -1601,4 +1884,3 @@ class DPAgent(BaseAgent):
         self.action = self.sample_action() # sample an action from the policy
         
         return self.action
-
