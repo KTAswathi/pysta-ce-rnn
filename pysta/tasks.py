@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Mapping
 
 from .envs import MazeEnv
 
 
 SUPPORTED_TASKS = ("maze", "abcd_fmri")
+
+
+@dataclass(frozen=True)
+class ABCDFMRIFactorialCell:
+    """One deterministic cell of the final scanner-style factorial design."""
+
+    factorial_index: int
+    base_configuration_index: int
+    configuration: tuple[int, int, int, int]
+    instruction_direction: int
+    execution_relation: int
+    seed: int
+    environment: object
 
 
 def _value(kwargs: Mapping[str, object], key: str, default):
@@ -27,23 +41,79 @@ def _abcd_evaluation_mode(kwargs: Mapping[str, object]) -> str:
     return mode
 
 
+def _configured_fmri_bases(kwargs: Mapping[str, object]):
+    """Parse and structurally validate an optional five-base scanner bank."""
+    from . import abcd_env
+
+    bases = tuple(
+        abcd_env.parse_configurations(kwargs.get("fmri_base_configurations"))
+    )
+    if not bases:
+        return ()
+    if len(bases) != 5:
+        raise ValueError(
+            "Final factorial fMRI evaluation requires exactly five explicit "
+            "fmri_base_configurations; Svenja's coordinates are not inferred "
+            "or synthetically substituted."
+        )
+    if len(set(bases)) != 5:
+        raise ValueError("fmri_base_configurations must contain five distinct bases.")
+
+    # Direct sequence reversal belongs in the crossed condition variables
+    # below, so it must not also appear as another base. Other non-reversal
+    # A/B/C/D assignments using the same four cells remain legitimate distinct
+    # configurations; the PDFs/specification do not justify excluding them.
+    base_set = set(bases)
+    inverse_duplicates = [
+        configuration
+        for configuration in bases
+        if tuple(reversed(configuration)) in base_set
+    ]
+    if inverse_duplicates:
+        raise ValueError(
+            "fmri_base_configurations must not contain direct inverse copies; "
+            "represent reversal with instruction_direction/execution_relation."
+        )
+
+    min_distance = int(_value(kwargs, "min_goal_distance", 2))
+    for configuration in bases:
+        if not abcd_env.configuration_has_minimum_distance(
+            configuration,
+            min_distance,
+            all_pairs=True,
+        ):
+            raise ValueError(
+                f"fMRI base configuration {configuration} violates the "
+                f"all-pairs Manhattan-distance minimum {min_distance}."
+            )
+    return bases
+
+
 def _abcd_configuration_banks(kwargs: Mapping[str, object]):
     """Build the ABCD training bank and selected evaluation bank.
 
     Familiar evaluation deliberately reuses exact ordered
-    training/familiarisation configurations, matching the primary
-    scanner-style evaluation. Held-out evaluation is the stricter
-    schema-generalisation test: it excludes all cyclic rotations in both
-    directions, i.e. the complete physical-route geometry class.
+    training/familiarisation configurations as an ordinary performance
+    monitor. Held-out evaluation is the stricter schema-generalisation test:
+    it excludes all cyclic rotations in both directions, i.e. the complete
+    physical-route geometry class. The distinct final scanner design is built
+    by :func:`make_fmri_evaluation_schedule`.
     """
     from . import abcd_env
 
     explicit_train = abcd_env.parse_configurations(kwargs.get("train_configurations"))
+    fmri_bases = _configured_fmri_bases(kwargs)
     synthetic_objective = kwargs.get("synthetic_fmri_bank_objective")
     if explicit_train and synthetic_objective is not None:
         raise ValueError(
             "Choose either explicit train_configurations or a "
             "synthetic_fmri_bank_objective, not both."
+        )
+    if fmri_bases and synthetic_objective is not None:
+        raise ValueError(
+            "The synthetic inverse-paired bank is not the final factorial fMRI "
+            "design; do not combine synthetic_fmri_bank_objective with explicit "
+            "fmri_base_configurations."
         )
 
     base_seed = int(_value(kwargs, "configuration_seed", 0))
@@ -57,9 +127,22 @@ def _abcd_configuration_banks(kwargs: Mapping[str, object]):
     num_train = int(_value(kwargs, "num_train_configurations", 12))
     if num_train < 1:
         raise ValueError("ABCD training configuration count must be positive.")
+    if fmri_bases and not explicit_train and num_train < len(fmri_bases):
+        raise ValueError(
+            "num_train_configurations must be at least five when explicit "
+            "fmri_base_configurations are supplied."
+        )
 
     if explicit_train:
         train_bank = explicit_train
+        if fmri_bases:
+            unfamiliar = set(fmri_bases).difference(train_bank)
+            if unfamiliar:
+                raise ValueError(
+                    "Every final fMRI base configuration must occur as the same "
+                    "ordered mapping in explicit train_configurations; missing "
+                    f"{sorted(unfamiliar)}."
+                )
     elif synthetic_objective is not None:
         if kwargs.get("num_train_configurations") not in (None, 10):
             raise ValueError(
@@ -70,6 +153,22 @@ def _abcd_configuration_banks(kwargs: Mapping[str, object]):
             seed=train_seed,
             objective=str(synthetic_objective),
         )
+    elif fmri_bases:
+        num_fill = num_train - len(fmri_bases)
+        filler = ()
+        if num_fill:
+            filler = abcd_env.generate_configuration_bank(
+                num_configurations=num_fill,
+                seed=train_seed,
+                min_manhattan_distance=min_distance,
+                prefer_all_pairs=True,
+                exclude_configurations=fmri_bases,
+                exclude_cycle_equivalents=True,
+                unique_up_to_cycle=True,
+            )
+        # Put the five scanner bases first so the relationship is visible in
+        # saved task metadata, then retain a larger deterministic training bank.
+        train_bank = tuple(fmri_bases) + tuple(filler)
     else:
         train_bank = abcd_env.generate_configuration_bank(
             num_configurations=num_train,
@@ -195,3 +294,107 @@ def make_environment(kwargs: Mapping[str, object], split: str = "train"):
         "prefer_all_pairs": True,
     })
     return ABCDFMRIEnv(**environment_kwargs)
+
+
+def _fmri_base_configuration_bank(kwargs: Mapping[str, object]):
+    """Validate the five explicitly supplied, familiar scanner bases.
+
+    The final design crosses these five bases with the two instruction
+    directions and two execution relations. Direct reversal is therefore a
+    condition manipulation, not another entry in this configuration bank.
+    """
+    if kwargs.get("task", "maze") != "abcd_fmri":
+        raise ValueError("Final factorial fMRI evaluation is only defined for abcd_fmri.")
+
+    bases = _configured_fmri_bases(kwargs)
+    if not bases:
+        raise ValueError(
+            "Final factorial fMRI evaluation requires exactly five explicit "
+            "fmri_base_configurations; Svenja's coordinates are not inferred "
+            "or synthetically substituted."
+        )
+
+    # Scanner configurations were familiarised. Keep that scientific meaning
+    # explicit instead of allowing a nominally fMRI-like held-out bank.
+    train_bank = tuple(_abcd_configuration_banks(kwargs)["train"])
+    unfamiliar = set(bases).difference(train_bank)
+    if unfamiliar:
+        raise ValueError(
+            "Every final fMRI base configuration must occur as the same ordered "
+            "mapping in the training/familiarisation bank; missing "
+            f"{sorted(unfamiliar)}."
+        )
+    return bases
+
+
+def make_fmri_evaluation_schedule(kwargs: Mapping[str, object]):
+    """Build the fixed 5 x 2 x 2 scanner-style evaluation schedule.
+
+    Ordering is base-major, then FORWARD/BACKWARD instruction direction, then
+    SAME/REVERSE execution relation. Each cell is an independent batch-one
+    environment, ensuring that ``BaseAgent.forward()`` resets the hidden state
+    once per block without randomly resampling any factorial variable.
+    """
+    from .abcd_env import (
+        ABCDFMRIEnv,
+        BACKWARD,
+        FORWARD,
+        REVERSE,
+        SAME,
+    )
+
+    bases = _fmri_base_configuration_bank(kwargs)
+    base_seed = int(
+        _value(
+            kwargs,
+            "fmri_evaluation_seed",
+            _value(kwargs, "eval_task_seed", int(_value(kwargs, "configuration_seed", 0)) + 3),
+        )
+    )
+    schedule = []
+    factorial_index = 0
+    for base_index, configuration in enumerate(bases):
+        # Reuse the same task seed across all four conditions of a spatial
+        # base. This makes the schedule reproducible and aligns stochastic
+        # start sampling as closely as target-exclusion permits.
+        cell_seed = base_seed + base_index
+        for instruction_direction in (FORWARD, BACKWARD):
+            for execution_relation in (SAME, REVERSE):
+                environment = ABCDFMRIEnv(
+                    batch_size=1,
+                    seed=cell_seed,
+                    configuration_bank=(configuration,),
+                    num_configurations=1,
+                    bank_name=(
+                        f"fmri_factorial_base{base_index}_"
+                        f"idir{instruction_direction}_exec{execution_relation}"
+                    ),
+                    instruction_directions=(instruction_direction,),
+                    execution_relations=(execution_relation,),
+                    num_loops=int(_value(kwargs, "n_loops", 5)),
+                    instruction_repeats=int(_value(kwargs, "instruction_repeats", 2)),
+                    max_navigation_steps=int(
+                        _value(kwargs, "max_navigation_steps", 200)
+                    ),
+                    start_policy=_value(
+                        kwargs, "start_position_policy", "exclude_first_goal"
+                    ),
+                    fixed_start=kwargs.get("start_position"),
+                    min_manhattan_distance=int(
+                        _value(kwargs, "min_goal_distance", 2)
+                    ),
+                    prefer_all_pairs=True,
+                )
+                schedule.append(
+                    ABCDFMRIFactorialCell(
+                        factorial_index=factorial_index,
+                        base_configuration_index=base_index,
+                        configuration=configuration,
+                        instruction_direction=instruction_direction,
+                        execution_relation=execution_relation,
+                        seed=cell_seed,
+                        environment=environment,
+                    )
+                )
+                factorial_index += 1
+    return tuple(schedule)

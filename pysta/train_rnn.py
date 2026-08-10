@@ -163,6 +163,86 @@ def _aggregate_route_consistency(block_summaries):
     }
 
 
+def _cpu_snapshot(value):
+    """Recursively detach factorial-evaluation trajectories onto CPU."""
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, dict):
+        return {key: _cpu_snapshot(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_snapshot(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_snapshot(item) for item in value)
+    return value
+
+
+def _capture_torch_rng_states(device):
+    """Capture RNG state so deterministic evaluation does not perturb training."""
+    states = {"cpu": torch.random.get_rng_state()}
+    if torch.cuda.is_available():
+        states["cuda"] = torch.cuda.get_rng_state_all()
+    if device.type == "mps" and hasattr(torch, "mps"):
+        states["mps"] = torch.mps.get_rng_state()
+    return states
+
+
+def _seed_torch_rng(seed, device):
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    if device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.manual_seed(int(seed))
+
+
+def _restore_torch_rng_states(states):
+    torch.random.set_rng_state(states["cpu"])
+    if "cuda" in states:
+        torch.cuda.set_rng_state_all(states["cuda"])
+    if "mps" in states:
+        torch.mps.set_rng_state(states["mps"])
+
+
+_AGENT_TRANSIENT_STATE_NAMES = (
+    "z",
+    "r",
+    "logpi",
+    "pi",
+    "action",
+    "env_action",
+    "optimal_actions",
+    "acc_loss",
+    "weight_loss",
+    "rate_loss",
+    "ent_loss",
+    "store",
+    "all_acts",
+    "all_acts_time_name",
+    "all_acts_metadata",
+)
+
+
+def _capture_agent_transient_state(rnn):
+    """Retain exact pre-evaluation state objects for transparent restoration."""
+    present = {
+        name: getattr(rnn, name)
+        for name in _AGENT_TRANSIENT_STATE_NAMES
+        if hasattr(rnn, name)
+    }
+    missing = set(_AGENT_TRANSIENT_STATE_NAMES).difference(present)
+    return present, missing
+
+
+def _restore_agent_transient_state(rnn, present, missing):
+    """Undo state/cache changes made by factorial ``forward`` calls."""
+    for name, value in present.items():
+        setattr(rnn, name, value)
+    for name in missing:
+        if hasattr(rnn, name):
+            delattr(rnn, name)
+
+
 @torch.no_grad()
 def _evaluate_abcd(rnn, eval_env, num_eval, evaluation_mode):
     """Evaluate complete ABCD blocks on the selected configuration set.
@@ -251,6 +331,201 @@ def _evaluate_heldout(rnn, eval_env, num_eval):
     )
 
 
+@torch.no_grad()
+def evaluate_abcd_fmri_factorial(rnn, schedule, evaluation_seed=None):
+    """Run the frozen model over the exact final 5 x 2 x 2 design.
+
+    ``schedule`` must be produced by
+    :func:`pysta.tasks.make_fmri_evaluation_schedule`. It contains one
+    independent batch-one environment for each base-major factorial cell, so
+    every block resets recurrent state and no condition is randomly sampled.
+    Model actions are autonomous and greedy; invalid boundary actions remain
+    genuine errors. Complete CPU trajectory stores are returned, aligned with
+    explicit factorial-cell metadata for later behavioural/fMRI analyses.
+    """
+    from pysta.abcd_env import (
+        EXECUTION_RELATION_NAMES,
+        INSTRUCTION_DIRECTION_NAMES,
+    )
+
+    schedule = tuple(schedule)
+    if len(schedule) != 20:
+        raise ValueError(
+            "Final factorial fMRI evaluation requires exactly 20 cells "
+            "(five bases x two instruction directions x two execution relations)."
+        )
+
+    observed_order = [
+        (
+            int(cell.factorial_index),
+            int(cell.base_configuration_index),
+            int(cell.instruction_direction),
+            int(cell.execution_relation),
+        )
+        for cell in schedule
+    ]
+    expected_order = [
+        (factorial_index, base_index, instruction_direction, execution_relation)
+        for factorial_index, (base_index, instruction_direction, execution_relation) in enumerate(
+            (
+                (base_index, instruction_direction, execution_relation)
+                for base_index in range(5)
+                for instruction_direction in range(2)
+                for execution_relation in range(2)
+            )
+        )
+    ]
+    if observed_order != expected_order:
+        raise ValueError(
+            "The factorial schedule must be in exact base-major order and "
+            "enumerate each base x instruction direction x execution relation "
+            "exactly once."
+        )
+
+    train_env = rnn.env
+    train_greedy = rnn.greedy
+    train_force_optimal = rnn.force_optimal
+    device = next(rnn.parameters()).device
+    rng_states = _capture_torch_rng_states(device)
+    numpy_rng_state = np.random.get_state()
+    transient_state, transient_state_missing = _capture_agent_transient_state(rnn)
+    if evaluation_seed is None:
+        evaluation_seed = int(schedule[0].seed)
+
+    block_losses = []
+    block_accuracies = []
+    environment_blocks = []
+    route_consistency_blocks = []
+    factorial_cells = []
+    trajectory_stores = []
+    try:
+        _seed_torch_rng(evaluation_seed, device)
+        np.random.seed(int(evaluation_seed))
+        rnn.greedy = True
+        rnn.force_optimal = False
+        for cell in schedule:
+            eval_env = cell.environment
+            if eval_env.batch != 1:
+                raise ValueError("Each factorial evaluation environment must have batch=1.")
+            if eval_env.obs_dim != train_env.obs_dim:
+                raise ValueError(
+                    "Training and factorial evaluation environments must have "
+                    f"the same observation dimension ({train_env.obs_dim} != "
+                    f"{eval_env.obs_dim})."
+                )
+            if eval_env.output_dim != train_env.output_dim:
+                raise ValueError(
+                    "Training and factorial evaluation environments must have "
+                    f"the same output dimension ({train_env.output_dim} != "
+                    f"{eval_env.output_dim})."
+                )
+
+            # Rewind the environment-owned RNG as well as recurrent noise so a
+            # repeated call with the same schedule is bitwise reproducible.
+            eval_env.rng = np.random.default_rng(int(cell.seed))
+            eval_env._block_counter = -1
+            rnn.env = eval_env
+            block_loss = rnn.forward(store=True)
+            loss = float(block_loss.detach().cpu())
+            accuracy = _stored_execution_accuracy(rnn.store)
+            route_summary = pysta.abcd_analysis_utils.summarize_route_consistency(rnn)
+            environment_metrics = {
+                key: _metric_to_cpu(value)
+                for key, value in eval_env.evaluation_metrics().items()
+            }
+
+            actual_configuration = tuple(int(value) for value in eval_env.configuration[0])
+            actual_instruction = int(eval_env.instruction_direction[0])
+            actual_relation = int(eval_env.execution_relation[0])
+            if (
+                actual_configuration != tuple(cell.configuration)
+                or actual_instruction != int(cell.instruction_direction)
+                or actual_relation != int(cell.execution_relation)
+            ):
+                raise RuntimeError(
+                    "A factorial environment resampled its fixed configuration "
+                    "or condition; the evaluation would not be balanced."
+                )
+
+            cell_metadata = {
+                "factorial_index": int(cell.factorial_index),
+                "base_configuration_index": int(cell.base_configuration_index),
+                "base_configuration": tuple(cell.configuration),
+                "instruction_direction": actual_instruction,
+                "instruction_direction_name": INSTRUCTION_DIRECTION_NAMES[
+                    actual_instruction
+                ],
+                "execution_relation": actual_relation,
+                "execution_relation_name": EXECUTION_RELATION_NAMES[actual_relation],
+                "presented_abstract_sequence": tuple(
+                    int(value) for value in eval_env.presented_sequence[0]
+                ),
+                "effective_execution_abstract_sequence": tuple(
+                    int(value) for value in eval_env.effective_execution_sequence[0]
+                ),
+                "task_seed": int(cell.seed),
+                "start_location": int(eval_env.start_location[0]),
+                "loss": loss,
+                "accuracy": accuracy,
+                "environment": environment_metrics,
+                "route_consistency": route_summary,
+            }
+            block_losses.append(loss)
+            block_accuracies.append(accuracy)
+            environment_blocks.append(environment_metrics)
+            route_consistency_blocks.append(route_summary)
+            factorial_cells.append(cell_metadata)
+            trajectory_stores.append(_cpu_snapshot(rnn.store))
+    finally:
+        rnn.env = train_env
+        rnn.greedy = train_greedy
+        rnn.force_optimal = train_force_optimal
+        _restore_torch_rng_states(rng_states)
+        np.random.set_state(numpy_rng_state)
+        _restore_agent_transient_state(
+            rnn, transient_state, transient_state_missing
+        )
+
+    metrics = {
+        "evaluation_design": "five_base_x_instruction_direction_x_execution_relation",
+        "factorial_order": (
+            "base_configuration_index, then FORWARD/BACKWARD "
+            "instruction_direction, then SAME/REVERSE execution_relation"
+        ),
+        "weights_frozen": True,
+        "autonomous": True,
+        "greedy": True,
+        "force_optimal": False,
+        "num_base_configurations": 5,
+        "num_blocks": 20,
+        "base_configurations": tuple(
+            tuple(schedule[base_index * 4].configuration)
+            for base_index in range(5)
+        ),
+        "base_configuration_statistics": (
+            pysta.abcd_env.configuration_bank_statistics(
+                tuple(
+                    schedule[base_index * 4].configuration
+                    for base_index in range(5)
+                )
+            )
+        ),
+        "evaluation_seed": int(evaluation_seed),
+        "evaluation_recurrent_noise": float(rnn.rec_noise),
+        "loss": float(np.mean(block_losses)),
+        "accuracy": float(np.nanmean(block_accuracies)),
+        "block_losses": block_losses,
+        "block_accuracies": block_accuracies,
+        "factorial_cells": factorial_cells,
+        "environment": _aggregate_environment_metrics(environment_blocks),
+        "route_consistency": _aggregate_route_consistency(
+            route_consistency_blocks
+        ),
+        "trajectory_stores": trajectory_stores,
+    }
+    return metrics["loss"], metrics["accuracy"], metrics
+
+
 def main_train(kwargs):
     
     # print arguments
@@ -275,6 +550,11 @@ def main_train(kwargs):
         if task == "abcd_fmri"
         else None
     )
+    fmri_factorial_schedule = None
+    if kwargs.get("run_final_fmri_evaluation", False):
+        # Validate before optimization starts, rather than discovering a
+        # missing/malformed five-base bank after a long training run.
+        fmri_factorial_schedule = pysta.tasks.make_fmri_evaluation_schedule(kwargs)
 
     # choose between baseline, line-embedded, and cortical-embedded RNN
     rnn = _make_rnn(env, kwargs).to(device)
@@ -303,6 +583,7 @@ def main_train(kwargs):
     # instantiate optimizer and some variables to keep track of
     optim = torch.optim.Adam(rnn.parameters(), lr=kwargs["lrate"])
     all_losses, all_accs, eval_metrics = [], [], []
+    fmri_factorial_metrics = None
     best_loss = np.inf
     epoch = -1  # permits a setup/save-only run with num_epochs=0
 
@@ -340,15 +621,28 @@ def main_train(kwargs):
                 sys.stdout.flush()
                 
                 if kwargs["save_results"]:
-                    pickle.dump({"epoch": epoch, "loss": all_losses, "accs": all_accs, "eval_metrics": eval_metrics, "evaluation_mode": evaluation_mode if task == "abcd_fmri" else None, "rnn": rnn, "best_loss": best_loss, "kwargs": kwargs, "optim": optim}, open(f"{savename}.p", "wb"))
+                    pickle.dump({"epoch": epoch, "loss": all_losses, "accs": all_accs, "eval_metrics": eval_metrics, "evaluation_mode": evaluation_mode if task == "abcd_fmri" else None, "fmri_factorial_metrics": fmri_factorial_metrics, "rnn": rnn, "best_loss": best_loss, "kwargs": kwargs, "optim": optim}, open(f"{savename}.p", "wb"))
                 
         optim.zero_grad() # reset gradient accumulator
         loss = rnn.forward() # compute loss
         loss.backward() # compute gradients
         optim.step() # update parameters
-        
+
+    if fmri_factorial_schedule is not None:
+        _, _, fmri_factorial_metrics = evaluate_abcd_fmri_factorial(
+            rnn,
+            fmri_factorial_schedule,
+            evaluation_seed=int(fmri_factorial_schedule[0].seed),
+        )
+        print(
+            "Final fMRI factorial evaluation:",
+            fmri_factorial_metrics["loss"],
+            fmri_factorial_metrics["accuracy"],
+            fmri_factorial_metrics["num_blocks"],
+        )
+
     if kwargs["save_results"]:
-        pickle.dump({"epoch": epoch, "loss": all_losses, "accs": all_accs, "eval_metrics": eval_metrics, "evaluation_mode": evaluation_mode if task == "abcd_fmri" else None, "rnn": rnn, "best_loss": best_loss, "kwargs": kwargs, "optim": optim}, open(f"{savename}.p", "wb"))
+        pickle.dump({"epoch": epoch, "loss": all_losses, "accs": all_accs, "eval_metrics": eval_metrics, "evaluation_mode": evaluation_mode if task == "abcd_fmri" else None, "fmri_factorial_metrics": fmri_factorial_metrics, "rnn": rnn, "best_loss": best_loss, "kwargs": kwargs, "optim": optim}, open(f"{savename}.p", "wb"))
         torch.save(rnn, f"{savename}_final.pt")
 
     return rnn

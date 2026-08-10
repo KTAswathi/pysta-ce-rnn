@@ -137,7 +137,7 @@ def parse_args(**kwargs):
         default='familiar',
         help=(
             "ABCD evaluation configuration set: 'familiar' reuses the "
-            "training/familiarisation bank (the primary fMRI-like setting), "
+            "training/familiarisation bank for ordinary performance monitoring, "
             "whereas 'heldout' evaluates schema generalisation on a disjoint bank"
         ),
     )
@@ -156,7 +156,7 @@ def parse_args(**kwargs):
     parser.add_argument('--train_configuration_seed', type=int, default=None, help="seed for generating the ABCD training configuration bank")
     parser.add_argument('--eval_configuration_seed', type=int, default=None, help="seed for generating the held-out ABCD evaluation configuration bank (used only with --evaluation_mode heldout)")
     parser.add_argument('--train_configurations', type=str, default=None, help="explicit semicolon-separated ordered ABCD training configurations")
-    parser.add_argument('--familiar_configurations', type=str, default=None, help="optional exact ordered subset of the training bank for primary familiar/fMRI-like evaluation")
+    parser.add_argument('--familiar_configurations', type=str, default=None, help="optional exact ordered subset of the training bank for ordinary familiar performance monitoring")
     parser.add_argument('--eval_configurations', type=str, default=None, help="explicit semicolon-separated ordered held-out ABCD evaluation configurations (used only with --evaluation_mode heldout)")
     parser.add_argument(
         '--synthetic_fmri_bank_objective',
@@ -164,8 +164,9 @@ def parse_args(**kwargs):
         default=None,
         help=(
             "use a deterministic synthetic 10-configuration/five-inverse-pair "
-            "training bank; explicitly choose the location-balance versus "
-            "mean-distance priority (these are not Svenja's coordinates)"
+            "training/comparison bank; explicitly choose the location-balance "
+            "versus mean-distance priority (these are not Svenja's coordinates "
+            "and this option is not used by final factorial fMRI evaluation)"
         ),
     )
     parser.add_argument('--num_train_configurations', type=int, default=None, help="number of generated ABCD training physical-cycle representatives (default 12)")
@@ -183,6 +184,34 @@ def parse_args(**kwargs):
     parser.add_argument('--instruction_directions', nargs='+', type=str, default=None, help="allowed ABCD instruction directions")
     parser.add_argument('--execution_relations', nargs='+', type=str, default=None, help="allowed ABCD execution relations")
     parser.add_argument('--min_goal_distance', type=int, default=None, help="minimum circular consecutive-goal Manhattan distance")
+    parser.add_argument(
+        '--fmri_base_configurations',
+        type=str,
+        default=None,
+        help=(
+            "exactly five explicit, familiar base spatial configurations for "
+            "the final scanner-style evaluation; direction/reversal is crossed "
+            "factorially and must not be duplicated in this bank"
+        ),
+    )
+    parser.add_argument(
+        '--fmri_evaluation_seed',
+        type=int,
+        default=None,
+        help=(
+            "deterministic task/start and recurrent-noise seed for the final "
+            "20-block factorial fMRI evaluation"
+        ),
+    )
+    parser.add_argument(
+        '--run_final_fmri_evaluation',
+        default=0,
+        type=int,
+        help=(
+            "after training, run once over five explicit base configurations "
+            "x two instruction directions x two execution relations"
+        ),
+    )
 
     # parse command line arguments
     parameters = vars(parser.parse_args())
@@ -205,6 +234,7 @@ def parse_args(**kwargs):
         "localize_loc_input",
         "localize_rew_input",
         "localize_wall_input",
+        "run_final_fmri_evaluation",
     ]
 
     for parameter in bool_parameters:
