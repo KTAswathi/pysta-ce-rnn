@@ -29,14 +29,19 @@ from pysta.abcd_env import (
     RIGHT,
     SAME,
     UP,
+    canonical_configuration_cycle,
+    configuration_bank_statistics,
+    configuration_cycle_variants,
     configuration_has_minimum_distance,
     generate_configuration_bank,
+    generate_synthetic_fmri_configuration_bank,
     location_to_row_col,
     manhattan_distance,
     move_location,
     parse_configurations,
     row_col_to_location,
     split_configuration_bank,
+    validate_fmri_configuration_bank,
 )
 
 
@@ -117,12 +122,14 @@ def test_configuration_generation_is_distinct_separated_and_deterministic():
         assert configuration_has_minimum_distance(configuration, 2, all_pairs=True)
 
     train, held_out = split_configuration_bank(
-        num_train=16, num_eval=12, seed=19
+        num_train=10, num_eval=8, seed=19
     )
     assert set(train).isdisjoint(held_out)
     assert {
-        tuple(reversed(configuration)) for configuration in train
-    }.isdisjoint(held_out)
+        canonical_configuration_cycle(configuration) for configuration in train
+    }.isdisjoint(
+        canonical_configuration_cycle(configuration) for configuration in held_out
+    )
     assert parse_configurations("0,2,8,6;2,8,6,0") == (
         (0, 2, 8, 6),
         (2, 8, 6, 0),
@@ -133,6 +140,59 @@ def test_configuration_generation_is_distinct_separated_and_deterministic():
         ABCDFMRIEnv(configuration_bank=[(0, 1, 8, 6)])
     with pytest.raises(ValueError, match="minimum"):
         ABCDFMRIEnv(configuration_bank=[(0, 5, 1, 6)])
+
+
+def test_cycle_equivalence_and_scanner_bank_statistics_are_explicit():
+    configuration = (0, 2, 8, 6)
+    variants = configuration_cycle_variants(configuration)
+    assert len(variants) == 8
+    assert len({canonical_configuration_cycle(value) for value in variants}) == 1
+    assert canonical_configuration_cycle((0, 2, 6, 8)) != (
+        canonical_configuration_cycle(configuration)
+    )
+
+    all_cycle_classes = generate_configuration_bank(
+        18, seed=4, unique_up_to_cycle=True
+    )
+    assert len(
+        {canonical_configuration_cycle(value) for value in all_cycle_classes}
+    ) == 18
+    with pytest.raises(ValueError, match="cycle-equivalence"):
+        generate_configuration_bank(19, seed=4, unique_up_to_cycle=True)
+
+    bases = generate_configuration_bank(5, seed=9, unique_up_to_cycle=True)
+    scanner_like = tuple(
+        value for base in bases for value in (base, tuple(reversed(base)))
+    )
+    report = validate_fmri_configuration_bank(scanner_like)
+    assert report == configuration_bank_statistics(scanner_like)
+    assert report["num_configurations"] == 10
+    assert report["num_direct_reversal_classes"] == 5
+    assert report["direct_reversals_complete"]
+    assert sum(report["location_counts"]) == 40
+    assert len(report["circular_manhattan_distances"]) == 10
+    assert isinstance(report["difference_from_reported_mean_2p6"], float)
+
+    with pytest.raises(ValueError, match="inverse"):
+        validate_fmri_configuration_bank(scanner_like[:-1] + (all_cycle_classes[7],))
+
+    balance_bank = generate_synthetic_fmri_configuration_bank(
+        seed=12, objective="balance_first"
+    )
+    assert balance_bank == generate_synthetic_fmri_configuration_bank(
+        seed=12, objective="balance_first"
+    )
+    distance_bank = generate_synthetic_fmri_configuration_bank(
+        seed=12, objective="distance_first"
+    )
+    balance_report = validate_fmri_configuration_bank(balance_bank)
+    distance_report = validate_fmri_configuration_bank(distance_bank)
+    assert balance_report["location_balance_squared_error"] <= (
+        distance_report["location_balance_squared_error"]
+    )
+    assert abs(distance_report["difference_from_reported_mean_2p6"]) <= abs(
+        balance_report["difference_from_reported_mean_2p6"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -243,16 +303,30 @@ def test_reward_dwell_has_fixed_location_no_policy_loss_and_then_advances():
     assert int(env._required_physical_location()[0]) == 2
 
 
-def test_configurable_starts_still_exclude_underspecified_at_target_case():
-    with pytest.raises(ValueError, match="exclude the first required goal"):
-        make_env(start_policy="fixed", fixed_start=0)
-    with pytest.raises(ValueError, match="exclude the first required goal"):
-        make_env().reset(start_locations=[0])
-
+def test_uniform_start_is_uniform_over_all_cells_and_target_start_is_well_defined():
     uniform = make_env(start_policy="uniform", fixed_start=None)
-    for _ in range(30):
+    counts = np.zeros(9, dtype=int)
+    for _ in range(900):
         uniform.reset()
-        assert int(uniform.loc[0]) != int(uniform._required_physical_location()[0])
+        counts[int(uniform.loc[0])] += 1
+    assert np.all(counts > 0)
+    assert counts.max() - counts.min() < 60
+
+    starts_at_target = make_env(start_policy="fixed", fixed_start=0)
+    assert starts_at_target.started_on_first_goal.tolist() == [True]
+    for _ in range(starts_at_target.total_instruction_steps - 1):
+        assert starts_at_target.step(torch.tensor([UP])).item() == 0
+    reward = starts_at_target.step(torch.tensor([UP]))
+    assert reward.item() == 1
+    assert starts_at_target.phase.tolist() == [REWARD]
+    assert starts_at_target.successful_goal_count.tolist() == [1]
+    assert starts_at_target.navigation_step_count.tolist() == [0]
+    assert not starts_at_target.policy_loss_mask()[0]
+    assert starts_at_target.post_step_metadata()["target_reached"].tolist() == [True]
+
+    # Explicit reset locations use the same documented onset rule.
+    starts_at_target.reset(start_locations=[0])
+    assert starts_at_target.started_on_first_goal.tolist() == [True]
 
 
 def test_asynchronous_batch_rows_can_occupy_different_phases():
@@ -488,30 +562,94 @@ def test_intended_semantic_and_embedded_input_routing():
     assert torch.all(agent.readout_unit_mask == 1)
 
 
-def test_abcd_cli_defaults_and_disjoint_task_factory(monkeypatch):
+def test_abcd_cli_familiar_primary_and_strict_heldout_task_factory(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train"])
     raw_defaults = pysta.argparser.apply_task_defaults({"task": "abcd_fmri"})
     assert raw_defaults["model_type"] == "corticallyembedded"
     assert raw_defaults["Nrec"] == 480
     abcd_defaults = pysta.argparser.parse_args(task="abcd_fmri")
     assert abcd_defaults["batch_size"] == 8
-    kwargs = pysta.argparser.parse_args(
+    assert abcd_defaults["evaluation_mode"] == "familiar"
+    familiar_kwargs = pysta.argparser.parse_args(
         task="abcd_fmri",
         batch_size=2,
         num_train_configurations=8,
         num_eval_configurations=7,
     )
-    assert kwargs["Nrec"] == 480
-    assert kwargs["embedding_name"] == "mpfc_projected_mask_linear0p1"
-    train = pysta.tasks.make_environment(kwargs, split="train")
-    evaluation = pysta.tasks.make_environment(kwargs, split="eval")
+    assert familiar_kwargs["Nrec"] == 480
+    assert familiar_kwargs["embedding_name"] == "mpfc_projected_mask_linear0p1"
+    train = pysta.tasks.make_environment(familiar_kwargs, split="train")
+    evaluation = pysta.tasks.make_environment(familiar_kwargs, split="eval")
     assert train.instruction_repeats == evaluation.instruction_repeats == 2
     assert train.num_loops == evaluation.num_loops == 5
-    assert set(train.configuration_bank).isdisjoint(evaluation.configuration_bank)
-    assert {
-        tuple(reversed(configuration)) for configuration in train.configuration_bank
-    }.isdisjoint(evaluation.configuration_bank)
+    assert train.configuration_bank == evaluation.configuration_bank
     assert train.name != evaluation.name
+
+    heldout_kwargs = dict(familiar_kwargs, evaluation_mode="heldout")
+    heldout_train = pysta.tasks.make_environment(heldout_kwargs, split="train")
+    heldout_eval = pysta.tasks.make_environment(heldout_kwargs, split="eval")
+    assert {
+        canonical_configuration_cycle(configuration)
+        for configuration in heldout_train.configuration_bank
+    }.isdisjoint(
+        canonical_configuration_cycle(configuration)
+        for configuration in heldout_eval.configuration_bank
+    )
+
+    familiar_subset = ";".join(
+        ",".join(str(value) for value in configuration)
+        for configuration in train.configuration_bank[:3]
+    )
+    subset_kwargs = dict(familiar_kwargs, familiar_configurations=familiar_subset)
+    subset_eval = pysta.tasks.make_environment(subset_kwargs, split="eval")
+    assert subset_eval.configuration_bank == train.configuration_bank[:3]
+
+    synthetic_kwargs = dict(
+        familiar_kwargs,
+        num_train_configurations=None,
+        synthetic_fmri_bank_objective="balance_first",
+    )
+    synthetic_train = pysta.tasks.make_environment(synthetic_kwargs, split="train")
+    synthetic_eval = pysta.tasks.make_environment(synthetic_kwargs, split="eval")
+    assert synthetic_train.configuration_bank == synthetic_eval.configuration_bank
+    validate_fmri_configuration_bank(synthetic_train.configuration_bank)
+
+    alien = generate_configuration_bank(
+        1,
+        seed=91,
+        exclude_configurations=train.configuration_bank,
+    )[0]
+    with pytest.raises(ValueError, match="familiar evaluation"):
+        pysta.tasks.make_environment(
+            dict(familiar_kwargs, familiar_configurations=[alien]), split="eval"
+        )
+
+
+def test_familiar_evaluation_is_autonomous_records_routes_and_restores_training_state():
+    train_env = make_env(num_loops=1, max_navigation_steps=5)
+    eval_env = make_env(num_loops=1, max_navigation_steps=5)
+    eval_env.bank_name = "eval_familiar"
+    agent = pysta.agents.VanillaRNN(
+        train_env,
+        Nrec=8,
+        rec_noise=0,
+        iters_per_action=1,
+        force_optimal=True,
+        greedy=False,
+    )
+    loss, accuracy, metrics = pysta.train_rnn._evaluate_abcd(
+        agent, eval_env, num_eval=1, evaluation_mode="familiar"
+    )
+    assert np.isfinite(loss)
+    assert np.isfinite(accuracy)
+    assert metrics["evaluation_mode"] == "familiar"
+    assert metrics["configuration_bank"] == eval_env.configuration_bank
+    assert metrics["configuration_bank_statistics"]["num_configurations"] == 1
+    assert metrics["route_consistency"]["action_source"] == "env_action"
+    assert metrics["evaluation_recurrent_noise"] == 0
+    assert agent.env is train_env
+    assert agent.force_optimal is True
+    assert agent.greedy is False
 
 
 def test_jensen_maze_and_legacy_routing_still_run(monkeypatch):

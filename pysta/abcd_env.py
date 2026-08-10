@@ -17,6 +17,7 @@ leave the location unchanged and can never produce reward.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from hashlib import sha1
 from itertools import combinations, permutations
 from typing import Iterable, Mapping, Sequence
@@ -176,6 +177,211 @@ def parse_configurations(configurations) -> tuple[tuple[int, int, int, int], ...
     return tuple(normalize_configuration(item) for item in configurations)
 
 
+def configuration_cycle_variants(
+    configuration: Sequence[int],
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Return all rotations of a circular route in both directions.
+
+    A configuration is an ordered A/B/C/D mapping, so these variants are not
+    interchangeable for familiar-condition bookkeeping.  They *are* the same
+    unoriented physical cycle for the stricter route-geometry held-out test.
+    """
+    configuration = normalize_configuration(configuration)
+    reverse = tuple(reversed(configuration))
+    variants = []
+    for oriented in (configuration, reverse):
+        for offset in range(4):
+            variant = oriented[offset:] + oriented[:offset]
+            if variant not in variants:
+                variants.append(variant)
+    return tuple(variants)
+
+
+def canonical_configuration_cycle(
+    configuration: Sequence[int],
+) -> tuple[int, int, int, int]:
+    """Canonical key for a circular route up to rotation and reversal."""
+    return min(configuration_cycle_variants(configuration))
+
+
+def configuration_bank_statistics(configurations) -> dict[str, object]:
+    """Summarize a configuration bank without claiming experimental identity.
+
+    The reported path length is the Manhattan distance for each of the four
+    circular goal-to-goal transitions.  This is the statistic that can be
+    compared with the PDF's reported mean of approximately 2.6 once the exact
+    scanner configurations are supplied explicitly.
+    """
+    bank = parse_configurations(configurations)
+    if not bank:
+        raise ValueError("Cannot summarize an empty ABCD configuration bank.")
+
+    location_counts = np.bincount(
+        np.asarray(bank, dtype=np.int64).reshape(-1), minlength=NUM_LOCATIONS
+    )
+    configuration_array = np.asarray(bank, dtype=np.int64)
+    abstract_label_location_counts = np.stack(
+        [
+            np.bincount(configuration_array[:, label], minlength=NUM_LOCATIONS)
+            for label in range(4)
+        ]
+    )
+    circular_distances = np.asarray(
+        [
+            [
+                manhattan_distance(configuration[index], configuration[(index + 1) % 4])
+                for index in range(4)
+            ]
+            for configuration in bank
+        ],
+        dtype=np.int64,
+    )
+    bank_set = set(bank)
+    physical_sets = {frozenset(configuration) for configuration in bank}
+    reversal_keys = {
+        min(configuration, tuple(reversed(configuration))) for configuration in bank
+    }
+    cycle_keys = {canonical_configuration_cycle(configuration) for configuration in bank}
+    expected_location_count = float(4 * len(bank) / NUM_LOCATIONS)
+    mean_circular_distance = float(circular_distances.mean())
+    return {
+        "num_configurations": len(bank),
+        "num_unique_ordered_configurations": len(bank_set),
+        "num_unique_physical_location_sets": len(physical_sets),
+        "num_direct_reversal_classes": len(reversal_keys),
+        "num_physical_cycle_classes": len(cycle_keys),
+        "location_counts": tuple(int(value) for value in location_counts),
+        "expected_location_count_if_uniform": expected_location_count,
+        "location_count_range": int(location_counts.max() - location_counts.min()),
+        "location_balance_squared_error": float(
+            np.square(location_counts - expected_location_count).sum()
+        ),
+        "abstract_label_location_counts": tuple(
+            tuple(int(value) for value in row)
+            for row in abstract_label_location_counts
+        ),
+        "circular_manhattan_distances": tuple(
+            tuple(int(value) for value in row) for row in circular_distances
+        ),
+        "per_configuration_mean_circular_manhattan_distance": tuple(
+            float(value) for value in circular_distances.mean(axis=1)
+        ),
+        "mean_circular_manhattan_distance": mean_circular_distance,
+        "difference_from_reported_mean_2p6": mean_circular_distance - 2.6,
+        "mean_nonwrapping_abc_to_d_manhattan_distance": float(
+            circular_distances[:, :3].mean()
+        ),
+        "all_pairs_minimum_distance_two": all(
+            configuration_has_minimum_distance(configuration, 2, all_pairs=True)
+            for configuration in bank
+        ),
+        "direct_reversals_complete": all(
+            tuple(reversed(configuration)) in bank_set for configuration in bank
+        ),
+    }
+
+
+def validate_fmri_configuration_bank(configurations) -> dict[str, object]:
+    """Validate the structural controls of an explicit ten-config scanner bank.
+
+    The PDFs do not report the ten coordinates, so this helper validates an
+    explicitly supplied bank rather than embedding invented coordinates.  It
+    enforces ten unique mappings arranged as five direct inverse pairs and the
+    reported all-pairs separation, then returns balance/path-length statistics
+    for transparent comparison with the reported controls.
+    """
+    bank = parse_configurations(configurations)
+    if len(bank) != 10:
+        raise ValueError(
+            f"An fMRI comparison bank must contain exactly 10 configurations, got {len(bank)}."
+        )
+    if len(set(bank)) != len(bank):
+        raise ValueError("An fMRI comparison bank must contain 10 unique mappings.")
+    if not all(
+        configuration_has_minimum_distance(configuration, 2, all_pairs=True)
+        for configuration in bank
+    ):
+        raise ValueError(
+            "Every pair of goal locations in an fMRI comparison configuration "
+            "must be at least two Manhattan steps apart."
+        )
+    bank_set = set(bank)
+    missing_reversals = [
+        configuration
+        for configuration in bank
+        if tuple(reversed(configuration)) not in bank_set
+    ]
+    if missing_reversals:
+        raise ValueError(
+            "The ten fMRI comparison mappings must form five direct inverse "
+            f"pairs; missing inverse for {missing_reversals}."
+        )
+    report = configuration_bank_statistics(bank)
+    if report["num_direct_reversal_classes"] != 5:
+        raise ValueError("The fMRI comparison bank must form exactly five inverse pairs.")
+    return report
+
+
+@lru_cache(maxsize=None)
+def generate_synthetic_fmri_configuration_bank(
+    *, seed: int = 0, objective: str = "balance_first"
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Construct a labelled synthetic ten-config bank with an explicit trade-off.
+
+    This is **not** Svenja's unreported coordinate set. It exhaustively selects
+    five distinct physical-cycle classes and includes each direct inverse.
+    Under the open-grid/all-pairs assumptions, location balance and an exact
+    circular mean of 2.6 cannot both be optimal, so callers must choose either
+    ``"balance_first"`` or ``"distance_first"``. The seed deterministically
+    breaks ties within the selected objective.
+    """
+    objective = str(objective).lower()
+    if objective not in ("balance_first", "distance_first"):
+        raise ValueError(
+            "Synthetic fMRI bank objective must be 'balance_first' or "
+            f"'distance_first', got {objective!r}."
+        )
+
+    cycle_representatives = generate_configuration_bank(
+        18,
+        seed=int(seed),
+        min_manhattan_distance=2,
+        prefer_all_pairs=True,
+        unique_up_to_cycle=True,
+    )
+    rng = np.random.default_rng(int(seed))
+    best_key = None
+    best_bank = None
+    for representative_indices in combinations(range(18), 5):
+        bases = tuple(
+            cycle_representatives[index] for index in representative_indices
+        )
+        bank = tuple(
+            configuration
+            for base in bases
+            for configuration in (base, tuple(reversed(base)))
+        )
+        report = configuration_bank_statistics(bank)
+        balance_error = float(report["location_balance_squared_error"])
+        distance_error = abs(
+            float(report["mean_circular_manhattan_distance"]) - 2.6
+        )
+        primary = (
+            (balance_error, distance_error)
+            if objective == "balance_first"
+            else (distance_error, balance_error)
+        )
+        key = (*primary, float(rng.random()))
+        if best_key is None or key < best_key:
+            best_key = key
+            best_bank = bank
+
+    # The finite search space is non-empty by construction. Validate the
+    # selected structural controls before exposing it.
+    validate_fmri_configuration_bank(best_bank)
+    return best_bank
+
+
 def generate_configuration_bank(
     num_configurations: int,
     seed: int,
@@ -184,6 +390,8 @@ def generate_configuration_bank(
     exclude_configurations=None,
     exclude_reverse_equivalents: bool = False,
     unique_up_to_reversal: bool = False,
+    exclude_cycle_equivalents: bool = False,
+    unique_up_to_cycle: bool = False,
 ) -> tuple[tuple[int, int, int, int], ...]:
     """Generate a deterministic bank of ordered physical ABCD mappings.
 
@@ -199,6 +407,11 @@ def generate_configuration_bank(
     excluded = set(parse_configurations(exclude_configurations))
     if exclude_reverse_equivalents:
         excluded |= {tuple(reversed(configuration)) for configuration in excluded}
+    excluded_cycle_keys = (
+        {canonical_configuration_cycle(configuration) for configuration in excluded}
+        if exclude_cycle_equivalents
+        else set()
+    )
     candidates = [
         tuple(configuration)
         for configuration in permutations(range(NUM_LOCATIONS), 4)
@@ -206,6 +419,10 @@ def generate_configuration_bank(
             configuration, min_manhattan_distance, all_pairs=False
         )
         and tuple(configuration) not in excluded
+        and (
+            not exclude_cycle_equivalents
+            or canonical_configuration_cycle(configuration) not in excluded_cycle_keys
+        )
     ]
     if prefer_all_pairs:
         candidates = [
@@ -225,7 +442,18 @@ def generate_configuration_bank(
 
     rng = np.random.default_rng(int(seed))
     ordered = [candidates[index] for index in rng.permutation(len(candidates))]
-    if unique_up_to_reversal:
+    if unique_up_to_cycle:
+        selected = []
+        selected_cycles = set()
+        for configuration in ordered:
+            cycle_key = canonical_configuration_cycle(configuration)
+            if cycle_key in selected_cycles:
+                continue
+            selected.append(configuration)
+            selected_cycles.add(cycle_key)
+            if len(selected) == num_configurations:
+                break
+    elif unique_up_to_reversal:
         selected = []
         selected_or_reversed = set()
         for configuration in ordered:
@@ -240,8 +468,11 @@ def generate_configuration_bank(
         selected = ordered[:num_configurations]
 
     if len(selected) != num_configurations:
+        equivalence_name = (
+            "cycle" if unique_up_to_cycle else "reversal"
+        )
         raise ValueError(
-            f"Only {len(selected)} configurations remain after reversal-equivalence "
+            f"Only {len(selected)} configurations remain after {equivalence_name}-equivalence "
             f"constraints; {num_configurations} requested."
         )
     return tuple(selected)
@@ -255,13 +486,13 @@ def split_configuration_bank(
     min_manhattan_distance: int = 2,
     prefer_all_pairs: bool = True,
 ) -> tuple[tuple[tuple[int, int, int, int], ...], tuple[tuple[int, int, int, int], ...]]:
-    """Build deterministic, disjoint training and held-out banks."""
+    """Build deterministic banks held out by complete physical-cycle class."""
     full_bank = generate_configuration_bank(
         int(num_train) + int(num_eval),
         seed=seed,
         min_manhattan_distance=min_manhattan_distance,
         prefer_all_pairs=prefer_all_pairs,
-        unique_up_to_reversal=True,
+        unique_up_to_cycle=True,
     )
     return full_bank[: int(num_train)], full_bank[int(num_train) :]
 
@@ -536,7 +767,7 @@ class ABCDFMRIEnv:
         ]
         for batch_index in range(self.batch):
             choices = np.arange(NUM_LOCATIONS)
-            if self.start_policy in ("exclude_first_goal", "uniform"):
+            if self.start_policy == "exclude_first_goal":
                 choices = choices[choices != int(first_physical[batch_index])]
             starts.append(int(self.rng.choice(choices)))
         return torch.tensor(starts, dtype=torch.long)
@@ -595,14 +826,12 @@ class ABCDFMRIEnv:
 
         self.loc = self._sample_start_locations(start_locations)
         self.start_location = self.loc.clone()
-        starts_on_target = self.loc == self._required_physical_location()
-        if torch.any(starts_on_target):
-            bad_rows = torch.where(starts_on_target)[0].tolist()
-            raise ValueError(
-                "Start locations must exclude the first required goal because "
-                "the task defines rewards on goal-reaching movements; invalid "
-                f"batch rows={bad_rows}."
-            )
+        # ``uniform`` genuinely samples all nine cells. The default
+        # ``exclude_first_goal`` policy avoids this edge case. If an explicit
+        # or uniform start already occupies the first target, execution onset
+        # satisfies that goal and produces the ordinary explicit REWARD dwell,
+        # without movement or a policy-loss timestep.
+        self.started_on_first_goal = self.loc == self._required_physical_location()
 
         self._post_step = self._empty_post_step_metadata()
         return self.loc
@@ -702,6 +931,7 @@ class ABCDFMRIEnv:
             "target_reached": zeros_bool.clone(),
             "next_phase": self.phase.clone(),
             "next_finished": self.finished.clone(),
+            "next_truncated": self.truncated.clone(),
             "next_loop_index": self.loop_index.clone(),
             "next_successful_goal_count": self.successful_goal_count.clone(),
             "next_required_abstract_goal_index": self._required_abstract_goal().clone(),
@@ -735,7 +965,17 @@ class ABCDFMRIEnv:
                     self.instruction_presentation_index[batch_index]
                     >= self.total_instruction_steps
                 ):
-                    self.phase[batch_index] = NAVIGATION
+                    if self.started_on_first_goal[batch_index]:
+                        # Explicit modelling rule for the optional true-uniform
+                        # start policy; the PDF does not specify this edge case.
+                        self.latest_rew[batch_index] = 1.0
+                        self.reward_event[batch_index] = True
+                        self.successful_goal_count[batch_index] += 1
+                        self.phase[batch_index] = REWARD
+                        post["reward_received"][batch_index] = 1.0
+                        post["target_reached"][batch_index] = True
+                    else:
+                        self.phase[batch_index] = NAVIGATION
 
             elif phase == REWARD:
                 # The currently observed REWARD timestep is the one explicit
@@ -795,6 +1035,7 @@ class ABCDFMRIEnv:
         post["post_action_location"] = self.loc.clone()
         post["next_phase"] = self.phase.clone()
         post["next_finished"] = self.finished.clone()
+        post["next_truncated"] = self.truncated.clone()
         post["next_loop_index"] = self.loop_index.clone()
         post["next_successful_goal_count"] = self.successful_goal_count.clone()
         post["next_required_abstract_goal_index"] = (
@@ -827,6 +1068,7 @@ class ABCDFMRIEnv:
             "phase_name": tuple(PHASE_NAMES[int(value)] for value in self.phase),
             "current_location": self.loc,
             "start_location": self.start_location,
+            "started_on_first_goal": self.started_on_first_goal,
             "configuration": self.configuration,
             "configuration_index": self.configuration_index,
             "instruction_direction": self.instruction_direction,
@@ -927,6 +1169,11 @@ __all__ = [
     "normalize_configuration",
     "configuration_has_minimum_distance",
     "parse_configurations",
+    "configuration_cycle_variants",
+    "canonical_configuration_cycle",
+    "configuration_bank_statistics",
+    "validate_fmri_configuration_bank",
+    "generate_synthetic_fmri_configuration_bank",
     "generate_configuration_bank",
     "split_configuration_bank",
 ]

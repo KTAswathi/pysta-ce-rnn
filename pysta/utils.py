@@ -97,6 +97,9 @@ def get_rnn_name(kwargs):
 
     # put these two parts together
     full_name = f"{env.name}/{rnn.name}"
+    if kwargs.get("task", "maze") == "abcd_fmri":
+        evaluation_mode = pysta.tasks._abcd_evaluation_mode(kwargs)
+        full_name = f"{full_name}/evaluation_{evaluation_mode}"
 
     return full_name
 

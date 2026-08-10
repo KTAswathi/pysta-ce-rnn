@@ -13,12 +13,15 @@ be analysed.  No cortical-gradient or Csub quantity is calculated here.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+
+from .abcd_env import manhattan_distance
 
 
 def _batch_aligned_value(value: Any, batch_size: int, field: str, timestep: int):
@@ -519,9 +522,461 @@ def extract_navigation_trajectories(
     return trajectories
 
 
+def _one_dimensional_navigation_field(
+    trajectory: Mapping[str, Any], field: str, *, boolean: bool = False
+) -> np.ndarray:
+    """Validate and return one scalar-valued field per navigation action."""
+    if field not in trajectory:
+        raise KeyError(
+            "ABCD route-consistency analysis requires stored field "
+            f"'{field}'."
+        )
+    value = np.asarray(trajectory[field]).reshape(-1)
+    expected = int(trajectory["num_navigation_steps"])
+    if len(value) != expected:
+        raise ValueError(
+            f"Navigation field '{field}' has {len(value)} values, expected "
+            f"{expected}."
+        )
+    if boolean:
+        if value.dtype != np.bool_:
+            raise TypeError(f"Navigation field '{field}' must be boolean.")
+    elif not np.issubdtype(value.dtype, np.integer):
+        raise TypeError(f"Navigation field '{field}' must contain integers.")
+    return value
+
+
+def _route_record(
+    trajectory: Mapping[str, Any], indices: list[int], *, completed: bool
+) -> dict[str, Any]:
+    """Build one JSON-safe realised leg record from navigation-row indices."""
+    first = indices[0]
+    last = indices[-1]
+    success_count = int(trajectory["successful_goal_count"][first])
+    target_abstract = int(
+        trajectory["current_required_abstract_goal_index"][first]
+    )
+    target_physical = int(
+        trajectory["current_required_physical_location"][first]
+    )
+    pre_locations = np.asarray(trajectory["pre_location"])[indices]
+    post_locations = np.asarray(trajectory["post_location"])[indices]
+    actions = np.asarray(trajectory["env_action"])[indices]
+
+    for index in indices:
+        if int(trajectory["successful_goal_count"][index]) != success_count:
+            raise ValueError("successful_goal_count changed within an ABCD leg.")
+        if (
+            int(trajectory["current_required_abstract_goal_index"][index])
+            != target_abstract
+            or int(trajectory["current_required_physical_location"][index])
+            != target_physical
+        ):
+            raise ValueError("The required ABCD target changed within a leg.")
+
+    if "action_valid" in trajectory:
+        action_valid = np.asarray(trajectory["action_valid"])[indices]
+        if action_valid.dtype != np.bool_:
+            raise TypeError("Navigation field 'action_valid' must be boolean.")
+        invalid_boundary_count = int(np.count_nonzero(~action_valid))
+    else:
+        # ABCD has no stay action, so a realised no-movement transition is
+        # necessarily an invalid boundary attempt.
+        invalid_boundary_count = int(
+            np.count_nonzero(pre_locations == post_locations)
+        )
+
+    locations = np.concatenate([pre_locations[:1], post_locations])
+    minimum_actions = manhattan_distance(int(locations[0]), target_physical)
+    action_count = len(indices)
+    if completed:
+        if int(locations[-1]) != target_physical:
+            raise ValueError(
+                "A leg marked target_reached does not end at its stored target."
+            )
+        excess_actions: int | None = action_count - minimum_actions
+        if excess_actions < 0:
+            raise ValueError(
+                "A completed ABCD route is shorter than Manhattan distance; "
+                "stored transitions are inconsistent."
+            )
+        shortest: bool | None = excess_actions == 0
+    else:
+        excess_actions = None
+        shortest = None
+
+    # successful_goal_count is the number of rewards before this movement.
+    # Count zero is the block-start -> first-goal approach.  Later slot-zero
+    # legs begin at the preceding fourth goal and are directly comparable.
+    initial_approach = success_count == 0
+    return {
+        "successful_goal_count_before": success_count,
+        "loop_index": success_count // 4,
+        "execution_slot": success_count % 4,
+        "target_abstract_goal_index": target_abstract,
+        "target_physical_location": target_physical,
+        "completed": bool(completed),
+        "initial_approach": initial_approach,
+        "included_in_repetition_consistency": bool(completed and not initial_approach),
+        "navigation_start_index": int(
+            np.asarray(trajectory["navigation_step_index"])[first]
+        ),
+        "navigation_end_index": int(
+            np.asarray(trajectory["navigation_step_index"])[last]
+        ),
+        "start_location": int(locations[0]),
+        "end_location": int(locations[-1]),
+        "actions": [int(action) for action in actions],
+        "locations": [int(location) for location in locations],
+        "action_count": action_count,
+        "minimum_action_count": minimum_actions,
+        "shortest": shortest,
+        "excess_actions": excess_actions,
+        "invalid_boundary_action_count": invalid_boundary_count,
+    }
+
+
+def _segment_realised_legs(trajectory: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Segment navigation actions by pre-transition success count and reward."""
+    num_steps = int(trajectory["num_navigation_steps"])
+    if num_steps == 0:
+        return []
+
+    success_count = _one_dimensional_navigation_field(
+        trajectory, "successful_goal_count"
+    )
+    target_reached = _one_dimensional_navigation_field(
+        trajectory, "target_reached", boolean=True
+    )
+    _one_dimensional_navigation_field(
+        trajectory, "current_required_abstract_goal_index"
+    )
+    _one_dimensional_navigation_field(
+        trajectory, "current_required_physical_location"
+    )
+    if np.any(success_count < 0):
+        raise ValueError("successful_goal_count cannot be negative.")
+
+    routes: list[dict[str, Any]] = []
+    current_indices: list[int] = []
+    current_success_count: int | None = None
+    for index in range(num_steps):
+        row_success_count = int(success_count[index])
+        if current_indices and row_success_count != current_success_count:
+            # Preserve malformed/truncated material rather than silently
+            # joining movements directed at different targets.
+            routes.append(_route_record(trajectory, current_indices, completed=False))
+            current_indices = []
+        if not current_indices:
+            current_success_count = row_success_count
+        current_indices.append(index)
+
+        if bool(target_reached[index]):
+            routes.append(_route_record(trajectory, current_indices, completed=True))
+            current_indices = []
+            current_success_count = None
+
+    if current_indices:
+        routes.append(_route_record(trajectory, current_indices, completed=False))
+    return routes
+
+
+def _pair_counts(signatures: list[tuple[int, ...]]) -> tuple[int, int]:
+    """Return exact-match and total unordered pair counts."""
+    total = len(signatures) * (len(signatures) - 1) // 2
+    matches = sum(count * (count - 1) // 2 for count in Counter(signatures).values())
+    return matches, total
+
+
+def _summary_from_groups(
+    route_groups: Sequence[Sequence[Mapping[str, Any]]]
+) -> dict[str, Any]:
+    """Aggregate routes while comparing repetition only within each group."""
+    routes = [route for group in route_groups for route in group]
+    completed = [route for route in routes if route["completed"]]
+    incomplete = [route for route in routes if not route["completed"]]
+
+    action_pair_matches = 0
+    action_pair_count = 0
+    location_pair_matches = 0
+    location_pair_count = 0
+    action_modal_count = 0
+    location_modal_count = 0
+    consistency_route_count = 0
+    consistency_group_count = 0
+    for group in route_groups:
+        comparable = [
+            route
+            for route in group
+            if route["included_in_repetition_consistency"]
+        ]
+        if comparable:
+            consistency_group_count += 1
+            consistency_route_count += len(comparable)
+            action_signatures = [tuple(route["actions"]) for route in comparable]
+            location_signatures = [tuple(route["locations"]) for route in comparable]
+            action_matches, action_pairs = _pair_counts(action_signatures)
+            location_matches, location_pairs = _pair_counts(location_signatures)
+            action_pair_matches += action_matches
+            action_pair_count += action_pairs
+            location_pair_matches += location_matches
+            location_pair_count += location_pairs
+            action_modal_count += max(Counter(action_signatures).values())
+            location_modal_count += max(Counter(location_signatures).values())
+
+    shortest_count = sum(bool(route["shortest"]) for route in completed)
+    total_excess = sum(int(route["excess_actions"]) for route in completed)
+    action_count = sum(int(route["action_count"]) for route in routes)
+    invalid_count = sum(
+        int(route["invalid_boundary_action_count"]) for route in routes
+    )
+    return {
+        "route_count": len(routes),
+        "completed_route_count": len(completed),
+        "incomplete_route_count": len(incomplete),
+        "consistency_route_count": consistency_route_count,
+        "consistency_group_count": consistency_group_count,
+        "exact_action_pair_matches": action_pair_matches,
+        "action_pair_count": action_pair_count,
+        "exact_action_pairwise_rate": (
+            action_pair_matches / action_pair_count if action_pair_count else None
+        ),
+        "exact_location_pair_matches": location_pair_matches,
+        "location_pair_count": location_pair_count,
+        "exact_location_pairwise_rate": (
+            location_pair_matches / location_pair_count
+            if location_pair_count
+            else None
+        ),
+        "action_modal_fraction": (
+            action_modal_count / consistency_route_count
+            if consistency_route_count
+            else None
+        ),
+        "location_modal_fraction": (
+            location_modal_count / consistency_route_count
+            if consistency_route_count
+            else None
+        ),
+        "shortest_route_count": shortest_count,
+        "shortest_route_fraction": (
+            shortest_count / len(completed) if completed else None
+        ),
+        "total_excess_actions": total_excess,
+        "mean_excess_actions": (
+            total_excess / len(completed) if completed else None
+        ),
+        "navigation_action_count": action_count,
+        "invalid_boundary_action_count": invalid_count,
+        "invalid_boundary_action_fraction": (
+            invalid_count / action_count if action_count else None
+        ),
+        "incomplete_navigation_action_count": sum(
+            int(route["action_count"]) for route in incomplete
+        ),
+    }
+
+
+def _last_valid_scalar(
+    stacked: Mapping[str, np.ndarray],
+    field: str,
+    valid_timestep: np.ndarray,
+    trial_index: int,
+    default: Any,
+) -> Any:
+    """Read a trial's final valid scalar field without touching padded rows."""
+    if field not in stacked:
+        return default
+    value = np.asarray(stacked[field])
+    if value.ndim < 2 or value.shape[:2] != valid_timestep.shape:
+        raise ValueError(
+            f"Field '{field}' must start with shape {valid_timestep.shape}, "
+            f"got {value.shape}."
+        )
+    valid_rows = np.flatnonzero(valid_timestep[:, trial_index])
+    if not len(valid_rows):
+        return default
+    scalar = np.asarray(value[valid_rows[-1], trial_index])
+    if scalar.ndim != 0:
+        raise ValueError(f"Terminal field '{field}' must be scalar per trial.")
+    return scalar.item()
+
+
+def summarize_route_consistency(store_or_stacked: Any) -> dict[str, Any]:
+    """Summarize realised ABCD route repetition, efficiency, and failures.
+
+    Repetition is assessed using the environment action actually executed
+    (``env_action``), never the unconstrained model action.  Navigation legs
+    are delimited by their pre-transition ``successful_goal_count`` and the
+    stored ``target_reached`` transition.  Instruction and reward dwell rows
+    are excluded by ``navigation_step_taken``.
+
+    Exact action- and location-route comparisons are made within each trial
+    and execution slot.  The initial block-start-to-first-goal approach
+    (pre-transition success count zero) is retained for shortest-path and
+    boundary-error summaries but excluded from repetition comparisons because
+    it has a different origin from later fourth-goal-to-first-goal legs.
+
+    The returned nested mapping contains only JSON-serializable Python values.
+    ``None`` denotes a rate without a denominator (for example, only one
+    comparable repetition).  Both per-trial/per-slot and pooled summaries
+    preserve their underlying counts so downstream aggregation is unambiguous.
+    """
+    agent_env = getattr(store_or_stacked, "env", None)
+    stacked = _as_numpy_stacked(store_or_stacked)
+    if "valid_timestep" not in stacked:
+        raise KeyError("Stacked ABCD store is missing 'valid_timestep'.")
+    valid_timestep = np.asarray(stacked["valid_timestep"])
+    if valid_timestep.ndim != 2 or valid_timestep.dtype != np.bool_:
+        raise ValueError("'valid_timestep' must be a boolean (time, batch) array.")
+    _, batch_size = valid_timestep.shape
+    trajectories = extract_navigation_trajectories(stacked, future_lags=())
+
+    env_finished = getattr(agent_env, "finished", None)
+    env_truncated = getattr(agent_env, "truncated", None)
+    env_success_count = getattr(agent_env, "successful_goal_count", None)
+    env_total_required = getattr(agent_env, "total_required_goals", None)
+    if torch.is_tensor(env_finished):
+        env_finished = env_finished.detach().cpu().numpy()
+    if torch.is_tensor(env_truncated):
+        env_truncated = env_truncated.detach().cpu().numpy()
+    if torch.is_tensor(env_success_count):
+        env_success_count = env_success_count.detach().cpu().numpy()
+
+    trial_summaries: list[dict[str, Any]] = []
+    routes_by_trial: list[list[dict[str, Any]]] = []
+    for trial_index, trajectory in enumerate(trajectories):
+        routes = _segment_realised_legs(trajectory)
+        routes_by_trial.append(routes)
+        slot_groups = {
+            str(slot): [
+                route for route in routes if route["execution_slot"] == slot
+            ]
+            for slot in range(4)
+        }
+        per_slot = {
+            slot: _summary_from_groups([slot_routes])
+            for slot, slot_routes in slot_groups.items()
+        }
+
+        stored_terminated = bool(
+            _last_valid_scalar(
+                stacked,
+                "next_finished",
+                valid_timestep,
+                trial_index,
+                _last_valid_scalar(
+                    stacked,
+                    "finished",
+                    valid_timestep,
+                    trial_index,
+                    False,
+                ),
+            )
+        )
+        stored_truncated = bool(
+            _last_valid_scalar(
+                stacked,
+                "next_truncated",
+                valid_timestep,
+                trial_index,
+                False,
+            )
+        )
+        if "truncated" in stacked:
+            truncated = np.asarray(stacked["truncated"])
+            if truncated.ndim < 2 or truncated.shape[:2] != valid_timestep.shape:
+                raise ValueError(
+                    "Field 'truncated' must start with the same (time, batch) "
+                    "shape as valid_timestep."
+                )
+            stored_truncated = stored_truncated or bool(
+                np.any(truncated[:, trial_index] & valid_timestep[:, trial_index])
+            )
+        final_success_count = int(
+            _last_valid_scalar(
+                stacked,
+                "next_successful_goal_count",
+                valid_timestep,
+                trial_index,
+                max(
+                    (
+                        int(route["successful_goal_count_before"])
+                        + int(route["completed"])
+                        for route in routes
+                    ),
+                    default=0,
+                ),
+            )
+        )
+
+        if env_finished is not None:
+            terminated = bool(np.asarray(env_finished)[trial_index])
+        else:
+            terminated = stored_terminated
+        if env_truncated is not None:
+            truncated_flag = bool(np.asarray(env_truncated)[trial_index])
+        else:
+            truncated_flag = stored_truncated
+            # The environment's pre-step truncated flag is normally false on
+            # the final stored transition.  A terminal unfinished leg is the
+            # lossless store-level signature of max-step truncation.
+            if terminated and any(not route["completed"] for route in routes):
+                truncated_flag = True
+        if env_success_count is not None:
+            final_success_count = int(np.asarray(env_success_count)[trial_index])
+
+        expected_success_count = (
+            int(env_total_required) if env_total_required is not None else None
+        )
+        if truncated_flag:
+            status = "truncated"
+        elif terminated:
+            status = "complete"
+        else:
+            status = "unterminated"
+        trial_summary = {
+            "trial_index": trial_index,
+            "status": status,
+            "terminated": terminated,
+            "truncated": truncated_flag,
+            "has_incomplete_route": any(not route["completed"] for route in routes),
+            "successful_goal_count": final_success_count,
+            "expected_successful_goal_count": expected_success_count,
+            "routes": routes,
+            "by_execution_slot": per_slot,
+            "overall": _summary_from_groups(list(slot_groups.values())),
+        }
+        trial_summaries.append(trial_summary)
+
+    pooled_groups_by_slot = {
+        str(slot): [
+            [route for route in routes if route["execution_slot"] == slot]
+            for routes in routes_by_trial
+        ]
+        for slot in range(4)
+    }
+    pooled_by_slot = {
+        slot: _summary_from_groups(groups)
+        for slot, groups in pooled_groups_by_slot.items()
+    }
+    pooled_groups = [
+        group
+        for slot_groups in pooled_groups_by_slot.values()
+        for group in slot_groups
+    ]
+    return {
+        "num_trials": batch_size,
+        "trials": trial_summaries,
+        "by_execution_slot": pooled_by_slot,
+        "overall": _summary_from_groups(pooled_groups),
+    }
+
+
 __all__ = [
     "stack_store_records",
     "export_agent_store",
     "save_agent_store",
     "extract_navigation_trajectories",
+    "summarize_route_consistency",
 ]

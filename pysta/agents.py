@@ -106,7 +106,16 @@ class BaseAgent(nn.Module):
 
             # also initialise some lists to store data along the way
             self.store = [] # store many things at the time of each action
-            self.all_acts = [[], [], []] # also store some information for dynamics in between actions
+            # Microstep-resolution activity storage.  Keep the original three
+            # positional lists for backwards compatibility:
+            #   0: recurrent activity, 1: physical location,
+            #   2: the environment's native time coordinate.
+            # Jensen MazeEnv therefore continues to store ``step_num`` in the
+            # third list.  Environments without Jensen planning semantics can
+            # expose their own time coordinate (ABCD uses ``block_timestep``).
+            self.all_acts = [[], [], []]
+            self.all_acts_time_name = None
+            self.all_acts_metadata = []
             
         # need gradients for setting initial z
         self.z = torch.zeros(torch.Size([self.env.batch])+self.z0.shape, device = self.z0.device) + self.z0[None, ...]
@@ -199,6 +208,93 @@ class BaseAgent(nn.Module):
         if isinstance(value, tuple):
             return tuple(BaseAgent._snapshot_value(item) for item in value)
         return value
+
+    @staticmethod
+    def _activity_snapshot(value):
+        """Make a detached CPU snapshot suitable for long-lived analysis data."""
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy().copy()
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        if isinstance(value, Mapping):
+            return {
+                key: BaseAgent._activity_snapshot(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [BaseAgent._activity_snapshot(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(BaseAgent._activity_snapshot(item) for item in value)
+        return value
+
+    def _activity_time(self):
+        """Return an environment-native time label without imposing Maze semantics."""
+        # Preserve the exact legacy coordinate for Jensen environments.  ABCD
+        # deliberately has no ``step_num`` because it has no planning period;
+        # its native coordinate is elapsed time within the recurrent block.
+        for name in ("step_num", "block_timestep"):
+            if hasattr(self.env, name):
+                return name, self._activity_snapshot(getattr(self.env, name))
+        return None, None
+
+    def _record_all_activity(self, recurrent_iteration, recurrent_iterations):
+        """Store one recurrent microstep plus environment-native metadata.
+
+        ``all_acts`` retains its historical positional representation.  The
+        parallel ``all_acts_metadata`` records the meaning of its third field
+        and phase/task-specific state, so consumers need not reinterpret an
+        ABCD block time as Jensen's planning/execution ``step_num``.
+        """
+        # Old pickled agents and a few legacy analysis scripts may replace
+        # ``all_acts`` directly instead of calling reset().  Initialise (or
+        # realign) the new parallel metadata cache lazily in that case.
+        existing_count = len(self.all_acts[0])
+        if (
+            not hasattr(self, "all_acts_metadata")
+            or len(self.all_acts_metadata) != existing_count
+        ):
+            self.all_acts_metadata = [None] * existing_count
+        if not hasattr(self, "all_acts_time_name"):
+            self.all_acts_time_name = None
+
+        time_name, activity_time = self._activity_time()
+        self.all_acts_time_name = time_name
+
+        activity = self._activity_snapshot(self.r)
+        location = self._activity_snapshot(getattr(self.env, "loc", None))
+        self.all_acts[0].append(activity)
+        self.all_acts[1].append(location)
+        self.all_acts[2].append(activity_time)
+
+        # Prefer a purpose-built lightweight hook when an environment exposes
+        # one, otherwise reuse its ordinary pre-transition trajectory metadata.
+        metadata_hook = getattr(self.env, "activity_metadata", None)
+        if not callable(metadata_hook):
+            metadata_hook = getattr(self.env, "trajectory_metadata", None)
+        if callable(metadata_hook):
+            environment_metadata = metadata_hook()
+            if environment_metadata is None:
+                environment_metadata = {}
+            if not isinstance(environment_metadata, Mapping):
+                raise TypeError(
+                    "env.activity_metadata()/trajectory_metadata() must return "
+                    "a mapping or None."
+                )
+            metadata = self._activity_snapshot(environment_metadata)
+        else:
+            metadata = {}
+
+        metadata.update(
+            {
+                "rnn_microstep_index": len(self.all_acts_metadata),
+                "recurrent_iteration": int(recurrent_iteration),
+                "recurrent_iterations": int(recurrent_iterations),
+                "activity_time_name": time_name,
+                "activity_time": self._activity_snapshot(activity_time),
+                "location": self._activity_snapshot(location),
+            }
+        )
+        self.all_acts_metadata.append(metadata)
 
     def _environment_metadata(self, hook_name):
         """Read and snapshot optional environment-specific trajectory metadata."""
@@ -621,7 +717,7 @@ class VanillaRNN(BaseAgent):
         
         # decide how many network iterations to run for this environment iteration
         network_iters = self.iters_per_action if type(self.iters_per_action) in [int, np.int32, np.int64] else np.random.choice(self.iters_per_action)
-        for _ in range(network_iters): # optionally several network iterations
+        for iter_ in range(network_iters): # optionally several network iterations
             
             # recurrent noise
             rec_noise = torch.randn(batch, self.Nrec, 1, device = self.z0.device) * self.rec_noise
@@ -641,10 +737,8 @@ class VanillaRNN(BaseAgent):
             # update rate loss for trials that have not finished
             self.rate_loss = self.rate_loss + self.calc_activity_reg(torch.where(~self.env.finished)[0])
             
-            if self.store_all_activity: # optinoally store activity at every RNN iteration
-                self.all_acts[0].append(self.r.detach().numpy())
-                self.all_acts[1].append( self.env.loc.detach().numpy())
-                self.all_acts[2].append(self.env.step_num)
+            if self.store_all_activity: # optionally store activity at every RNN iteration
+                self._record_all_activity(iter_, network_iters)
         
         # compute output
         if self.nonlin_output:
@@ -1019,7 +1113,7 @@ class LineEmbeddedRNN(VanillaRNN):
             else np.random.choice(self.iters_per_action)
         )
 
-        for _ in range(network_iters):
+        for iter_ in range(network_iters):
             rec_noise = torch.randn(batch, self.Nrec, 1, device=self.z0.device) * self.rec_noise
 
             # Apply the validated combined routing mask. Whole-object Jensen
@@ -1045,9 +1139,7 @@ class LineEmbeddedRNN(VanillaRNN):
             )
 
             if self.store_all_activity:
-                self.all_acts[0].append(self.r.detach().numpy())
-                self.all_acts[1].append(self.env.loc.detach().numpy())
-                self.all_acts[2].append(self.env.step_num)
+                self._record_all_activity(iter_, network_iters)
 
         # restrict which units contribute to the readout
         masked_r = self.r * self.readout_unit_mask[None, :, None]
@@ -1535,9 +1627,7 @@ class SpaceTimeAttractor(BaseAgent):
             self.r = self.phi(self.z) # apply exponential nonlinearity to compute firing rates
 
             if self.store_all_activity: # optionally store activity at every RNN iteration
-                self.all_acts[0].append(self.r.detach().numpy())
-                self.all_acts[1].append( self.env.loc.detach().numpy())
-                self.all_acts[2].append(self.env.step_num)
+                self._record_all_activity(iter_, network_iters)
 
         #compute the policy
         self.calc_policy()

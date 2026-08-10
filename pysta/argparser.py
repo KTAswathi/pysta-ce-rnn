@@ -131,6 +131,16 @@ def parse_args(**kwargs):
     parser.add_argument('--overwrite', default=0, type=int, help="allow overwrite of existing model of the same name")
     parser.add_argument('--eval_freq', type=int, default=200, help="number of batches between each instance of evaluation and model saving")
     parser.add_argument('--num_eval', type=int, default=10, help="number of batches to use for evaluation")
+    parser.add_argument(
+        '--evaluation_mode',
+        choices=['familiar', 'heldout'],
+        default='familiar',
+        help=(
+            "ABCD evaluation configuration set: 'familiar' reuses the "
+            "training/familiarisation bank (the primary fMRI-like setting), "
+            "whereas 'heldout' evaluates schema generalisation on a disjoint bank"
+        ),
+    )
     parser.add_argument('--num_epochs', type=int, default=200000, help="number of epochs to train for")
     parser.add_argument('--prefix', type=str, default="", help="optional prefix to the model name")
     parser.add_argument('--lrate', type=float, default=3e-4, help="ADAM learning rate")
@@ -144,18 +154,29 @@ def parse_args(**kwargs):
     parser.add_argument('--instruction_repeats', type=int, default=None, help="number of presentations of each ABCD instruction")
     parser.add_argument('--configuration_seed', type=int, default=0, help="base seed used when task-specific configuration seeds are omitted")
     parser.add_argument('--train_configuration_seed', type=int, default=None, help="seed for generating the ABCD training configuration bank")
-    parser.add_argument('--eval_configuration_seed', type=int, default=None, help="seed for generating the held-out ABCD evaluation configuration bank")
+    parser.add_argument('--eval_configuration_seed', type=int, default=None, help="seed for generating the held-out ABCD evaluation configuration bank (used only with --evaluation_mode heldout)")
     parser.add_argument('--train_configurations', type=str, default=None, help="explicit semicolon-separated ordered ABCD training configurations")
-    parser.add_argument('--eval_configurations', type=str, default=None, help="explicit semicolon-separated ordered ABCD evaluation configurations")
-    parser.add_argument('--num_train_configurations', type=int, default=None, help="number of generated ABCD training configurations")
-    parser.add_argument('--num_eval_configurations', type=int, default=None, help="number of generated held-out ABCD evaluation configurations")
+    parser.add_argument('--familiar_configurations', type=str, default=None, help="optional exact ordered subset of the training bank for primary familiar/fMRI-like evaluation")
+    parser.add_argument('--eval_configurations', type=str, default=None, help="explicit semicolon-separated ordered held-out ABCD evaluation configurations (used only with --evaluation_mode heldout)")
+    parser.add_argument(
+        '--synthetic_fmri_bank_objective',
+        choices=['balance_first', 'distance_first'],
+        default=None,
+        help=(
+            "use a deterministic synthetic 10-configuration/five-inverse-pair "
+            "training bank; explicitly choose the location-balance versus "
+            "mean-distance priority (these are not Svenja's coordinates)"
+        ),
+    )
+    parser.add_argument('--num_train_configurations', type=int, default=None, help="number of generated ABCD training physical-cycle representatives (default 12)")
+    parser.add_argument('--num_eval_configurations', type=int, default=None, help="number of generated held-out physical-cycle representatives (default 6; used only with --evaluation_mode heldout)")
     parser.add_argument('--train_task_seed', type=int, default=None, help="RNG seed for sampling ABCD training blocks")
-    parser.add_argument('--eval_task_seed', type=int, default=None, help="RNG seed for sampling held-out ABCD evaluation blocks")
+    parser.add_argument('--eval_task_seed', type=int, default=None, help="independent RNG seed for sampling ABCD evaluation blocks")
     parser.add_argument(
         '--start_position_policy',
         choices=['exclude_first_goal', 'uniform', 'fixed'],
         default=None,
-        help="ABCD non-target start policy; fixed also requires --start_position",
+        help="ABCD start policy: default excludes the first target; uniform samples all 9 cells; fixed also requires --start_position",
     )
     parser.add_argument('--start_position', type=int, default=None, help="fixed ABCD start location ID")
     parser.add_argument('--max_navigation_steps', type=int, default=None, help="maximum ABCD navigation actions in one block")
