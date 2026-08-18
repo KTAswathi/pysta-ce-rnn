@@ -46,19 +46,39 @@ python -m pysta.train_rnn --task abcd_fmri \
 Explicit ordered `A,B,C,D` banks can be supplied as semicolon-separated rows,
 for example `--train_configurations '0,2,8,6;8,6,0,2'`. Generated banks are
 seeded, enforce the goal-distance constraint, and held-out banks exclude both
-directions and every cyclic rotation of each training route. Exact experimental
-coordinates are not encoded.
+directions and every cyclic rotation of each training route.
 
 The final scanner-style evaluation is a distinct deterministic factorial
-schedule: exactly five user-supplied base spatial configurations are each
+schedule: exactly five base spatial configurations are each
 crossed with both instruction directions and both execution relations, yielding
 20 independent blocks in base-major, `FORWARD`/`BACKWARD`, then
-`SAME`/`REVERSE` order. Supply the five familiar bases with
-`--fmri_base_configurations` and opt in with
-`--run_final_fmri_evaluation 1`. The five bases are included in a generated
-larger training bank; no reversed copies are added as separate configurations.
-The command rejects a missing/malformed bank rather than inventing Svenja's
-coordinates.
+`SAME`/`REVERSE` order. Opt in with `--run_final_fmri_evaluation 1`. Because the
+PDFs do not publish Svenja's five coordinate tuples, an explicitly labelled
+synthetic fallback is built in:
+
+```text
+0,2,4,8;2,6,8,0;5,1,3,7;6,8,0,4;7,3,5,1
+```
+
+The fallback is defined as `DEFAULT_FMRI_BASE_CONFIGURATIONS` near the top of
+`pysta/abcd_env.py`. It satisfies the reported all-pairs distance constraint
+and achieves the best possible location-frequency balance (cell counts
+`3,2,2,2,2,2,2,2,3`). Each abstract label occupies five distinct cells with a
+grid-centre centroid, and each circular transition position has equal aggregate
+distance.
+Its circular mean subpath length is 2.4 rather than the paper's approximately
+2.6: exhaustive search over valid five-cycle-class banks shows that exact 2.6
+and optimal location balance cannot both be obtained under the
+open-grid/all-pairs constraints. Exact coordinates can replace the fallback
+without a code edit via `--fmri_base_configurations`, using exactly five
+semicolon-separated rows of four integer location IDs (the fallback itself
+would be written as
+`'0,2,4,8;2,6,8,0;5,1,3,7;6,8,0,4;7,3,5,1'`). An explicit value always takes
+precedence. During a final-factorial run, the five resolved bases are prepended
+to seven deterministic fillers in the default 12-configuration training bank;
+reversed copies are represented by the factorial conditions, not duplicated in
+the bank. Ordinary ABCD runs that do not request the final factorial retain the
+previous seeded generated-bank behaviour.
 
 Two lightweight verification commands do not train N480:
 
