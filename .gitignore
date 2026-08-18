@@ -1,0 +1,21 @@
+# macOS metadata
+.DS_Store
+
+# Python bytecode caches
+__pycache__/
+
+# Local model, figure, and analysis outputs
+/models/
+/figures/
+/data/rnn_analyses/
+
+# Local cortical-embedding artifacts
+/data/embedding/anchor_checks/
+/data/embedding/custom_roi_vertices-old/
+/data/embedding/custom_roi_vertices/mpfc_projected_mask_linear0p1/
+/data/embedding/subsampled/human/mpfc_projected_mask_linear0p1/
+
+# Local task/references and reports
+/interactive_tasks/
+/references/
+/reports/
