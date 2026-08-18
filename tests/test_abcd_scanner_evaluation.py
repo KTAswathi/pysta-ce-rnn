@@ -8,6 +8,11 @@ import torch
 
 import pysta
 from pysta.abcd_env import BACKWARD, FORWARD, REVERSE, SAME
+from pysta.abcd_env import (
+    DEFAULT_FMRI_BASE_CONFIGURATIONS,
+    configuration_bank_statistics,
+    manhattan_distance,
+)
 
 
 # Five deterministic examples used only by these tests. They are not claimed
@@ -47,6 +52,73 @@ def test_scanner_cli_is_opt_in_and_distinct_from_familiar_monitor(monkeypatch):
     assert args["evaluation_mode"] == "familiar"
     assert args["fmri_base_configurations"] is None
     assert args["run_final_fmri_evaluation"] is False
+
+
+def test_documented_default_bases_are_balanced_and_used_for_final_design():
+    report = configuration_bank_statistics(DEFAULT_FMRI_BASE_CONFIGURATIONS)
+    assert DEFAULT_FMRI_BASE_CONFIGURATIONS == (
+        (0, 2, 4, 8),
+        (2, 6, 8, 0),
+        (5, 1, 3, 7),
+        (6, 8, 0, 4),
+        (7, 3, 5, 1),
+    )
+    assert report["num_unique_ordered_configurations"] == 5
+    assert report["num_physical_cycle_classes"] == 5
+    assert report["location_counts"] == (3, 2, 2, 2, 2, 2, 2, 2, 3)
+    assert report["location_count_range"] == 1
+    assert report["all_pairs_minimum_distance_two"] is True
+    assert report["mean_circular_manhattan_distance"] == pytest.approx(2.4)
+
+    # Each abstract label is spread across five locations with its centroid at
+    # the grid centre; each circular transition position has the same total
+    # path length across bases.
+    for abstract_index in range(4):
+        locations = [base[abstract_index] for base in DEFAULT_FMRI_BASE_CONFIGURATIONS]
+        assert len(set(locations)) == 5
+        assert np.mean([location // 3 for location in locations]) == 1
+        assert np.mean([location % 3 for location in locations]) == 1
+    assert [
+        sum(
+            manhattan_distance(base[index], base[(index + 1) % 4])
+            for base in DEFAULT_FMRI_BASE_CONFIGURATIONS
+        )
+        for index in range(4)
+    ] == [12, 12, 12, 12]
+
+    kwargs = _kwargs(run_final_fmri_evaluation=True)
+    kwargs.pop("fmri_base_configurations")
+    banks = pysta.tasks._abcd_configuration_banks(kwargs)
+    assert banks["train"][:5] == DEFAULT_FMRI_BASE_CONFIGURATIONS
+    assert len(banks["train"]) == 12
+    assert banks["eval"] == banks["train"]
+
+    schedule = pysta.tasks.make_fmri_evaluation_schedule(kwargs)
+    assert len(schedule) == 20
+    assert tuple(cell.configuration for cell in schedule[::4]) == (
+        DEFAULT_FMRI_BASE_CONFIGURATIONS
+    )
+
+    # Without the opt-in, an ordinary run uses its previous generated bank;
+    # do not silently mislabel the fallback configurations as familiar.
+    kwargs["run_final_fmri_evaluation"] = False
+    with pytest.raises(ValueError, match="made familiar only when"):
+        pysta.tasks.make_fmri_evaluation_schedule(kwargs)
+
+
+def test_default_fmri_bases_do_not_change_ordinary_or_synthetic_bank_modes():
+    kwargs = _kwargs()
+    kwargs.pop("fmri_base_configurations")
+    ordinary = pysta.tasks._abcd_configuration_banks(kwargs)
+    assert pysta.tasks._configured_fmri_bases(kwargs) == ()
+    assert ordinary["train"] != DEFAULT_FMRI_BASE_CONFIGURATIONS
+
+    kwargs.update(
+        synthetic_fmri_bank_objective="balance_first",
+        num_train_configurations=10,
+    )
+    synthetic = pysta.tasks._abcd_configuration_banks(kwargs)
+    assert len(synthetic["train"]) == 10
 
 
 def test_five_bases_are_familiar_and_not_inverse_paired():

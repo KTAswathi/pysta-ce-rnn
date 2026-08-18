@@ -41,20 +41,29 @@ def _abcd_evaluation_mode(kwargs: Mapping[str, object]) -> str:
     return mode
 
 
-def _configured_fmri_bases(kwargs: Mapping[str, object]):
-    """Parse and structurally validate an optional five-base scanner bank."""
+def _configured_fmri_bases(
+    kwargs: Mapping[str, object], *, use_default: bool = False
+):
+    """Resolve and structurally validate a five-base scanner bank.
+
+    An explicit ``fmri_base_configurations`` value always wins.  The labelled
+    synthetic fallback is used only when requested by the final factorial
+    design, so ordinary ABCD runs and the older synthetic comparison profile
+    retain their previous configuration-bank behaviour.
+    """
     from . import abcd_env
 
-    bases = tuple(
-        abcd_env.parse_configurations(kwargs.get("fmri_base_configurations"))
-    )
+    raw_bases = kwargs.get("fmri_base_configurations")
+    if raw_bases is None and use_default:
+        bases = abcd_env.DEFAULT_FMRI_BASE_CONFIGURATIONS
+    else:
+        bases = tuple(abcd_env.parse_configurations(raw_bases))
     if not bases:
         return ()
     if len(bases) != 5:
         raise ValueError(
-            "Final factorial fMRI evaluation requires exactly five explicit "
-            "fmri_base_configurations; Svenja's coordinates are not inferred "
-            "or synthetically substituted."
+            "Final factorial fMRI evaluation requires exactly five "
+            "fmri_base_configurations."
         )
     if len(set(bases)) != 5:
         raise ValueError("fmri_base_configurations must contain five distinct bases.")
@@ -102,8 +111,11 @@ def _abcd_configuration_banks(kwargs: Mapping[str, object]):
     from . import abcd_env
 
     explicit_train = abcd_env.parse_configurations(kwargs.get("train_configurations"))
-    fmri_bases = _configured_fmri_bases(kwargs)
     synthetic_objective = kwargs.get("synthetic_fmri_bank_objective")
+    fmri_bases = _configured_fmri_bases(
+        kwargs,
+        use_default=bool(kwargs.get("run_final_fmri_evaluation", False)),
+    )
     if explicit_train and synthetic_objective is not None:
         raise ValueError(
             "Choose either explicit train_configurations or a "
@@ -112,8 +124,8 @@ def _abcd_configuration_banks(kwargs: Mapping[str, object]):
     if fmri_bases and synthetic_objective is not None:
         raise ValueError(
             "The synthetic inverse-paired bank is not the final factorial fMRI "
-            "design; do not combine synthetic_fmri_bank_objective with explicit "
-            "fmri_base_configurations."
+            "design; do not combine synthetic_fmri_bank_objective with final "
+            "factorial base configurations."
         )
 
     base_seed = int(_value(kwargs, "configuration_seed", 0))
@@ -129,8 +141,8 @@ def _abcd_configuration_banks(kwargs: Mapping[str, object]):
         raise ValueError("ABCD training configuration count must be positive.")
     if fmri_bases and not explicit_train and num_train < len(fmri_bases):
         raise ValueError(
-            "num_train_configurations must be at least five when explicit "
-            "fmri_base_configurations are supplied."
+            "num_train_configurations must be at least five when final "
+            "factorial base configurations are used."
         )
 
     if explicit_train:
@@ -297,21 +309,30 @@ def make_environment(kwargs: Mapping[str, object], split: str = "train"):
 
 
 def _fmri_base_configuration_bank(kwargs: Mapping[str, object]):
-    """Validate the five explicitly supplied, familiar scanner bases.
+    """Resolve and validate the five familiar scanner bases.
 
     The final design crosses these five bases with the two instruction
     directions and two execution relations. Direct reversal is therefore a
-    condition manipulation, not another entry in this configuration bank.
+    condition manipulation, not another entry in this configuration bank. If
+    no explicit bank is supplied, the documented synthetic fallback from
+    :mod:`pysta.abcd_env` is used.
     """
     if kwargs.get("task", "maze") != "abcd_fmri":
         raise ValueError("Final factorial fMRI evaluation is only defined for abcd_fmri.")
 
-    bases = _configured_fmri_bases(kwargs)
+    using_default = kwargs.get("fmri_base_configurations") is None
+    if using_default and not bool(kwargs.get("run_final_fmri_evaluation", False)):
+        raise ValueError(
+            "The default fMRI base configurations are made familiar only when "
+            "run_final_fmri_evaluation is enabled. Set that opt-in flag, or "
+            "supply explicit fmri_base_configurations already present in the "
+            "training bank."
+        )
+    bases = _configured_fmri_bases(kwargs, use_default=True)
     if not bases:
         raise ValueError(
-            "Final factorial fMRI evaluation requires exactly five explicit "
-            "fmri_base_configurations; Svenja's coordinates are not inferred "
-            "or synthetically substituted."
+            "Final factorial fMRI evaluation requires exactly five "
+            "fmri_base_configurations."
         )
 
     # Scanner configurations were familiarised. Keep that scientific meaning

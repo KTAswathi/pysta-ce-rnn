@@ -42,6 +42,30 @@ EXECUTION_RELATION_NAMES = ("SAME", "REVERSE")
 SAME, REVERSE = range(2)
 
 
+# Synthetic, PDF-controlled fallback for the final scanner-style evaluation.
+# These are NOT Svenja Küchenhoff's coordinates, which are not reported in the
+# supplied PDFs.  The row-major location IDs use the grid shown above.  This
+# deterministic bank satisfies the reported all-pairs Manhattan separation,
+# has five distinct circular route classes and no direct reversal duplicates,
+# and gives the mathematically best possible distribution of 20 goal
+# appearances over nine cells: (3, 2, 2, 2, 2, 2, 2, 2, 3).  Each abstract
+# label occupies five distinct cells with grid-centre centroid, and each of the
+# four circular transition positions has the same aggregate distance.
+# Its mean circular subpath length is 2.4 rather than the approximately 2.6
+# reported in the paper; exhaustive search over valid five-cycle-class banks
+# shows that exact 2.6 and optimal location balance cannot coexist under the
+# open-grid/all-pairs constraints.
+# Supply --fmri_base_configurations to replace this modelling fallback when
+# the exact experimental coordinates become available.
+DEFAULT_FMRI_BASE_CONFIGURATIONS = (
+    (0, 2, 4, 8),
+    (2, 6, 8, 0),
+    (5, 1, 3, 7),
+    (6, 8, 0, 4),
+    (7, 3, 5, 1),
+)
+
+
 OBSERVATION_SLICES = {
     "current_location": slice(0, 9),
     "instruction_location": slice(9, 18),
@@ -1161,6 +1185,7 @@ __all__ = [
     "EXECUTION_RELATION_NAMES",
     "SAME",
     "REVERSE",
+    "DEFAULT_FMRI_BASE_CONFIGURATIONS",
     "OBSERVATION_SLICES",
     "location_to_row_col",
     "row_col_to_location",

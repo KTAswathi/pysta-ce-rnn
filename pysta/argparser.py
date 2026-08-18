@@ -183,15 +183,17 @@ def parse_args(**kwargs):
     parser.add_argument('--max_navigation_steps', type=int, default=None, help="maximum ABCD navigation actions in one block")
     parser.add_argument('--instruction_directions', nargs='+', type=str, default=None, help="allowed ABCD instruction directions")
     parser.add_argument('--execution_relations', nargs='+', type=str, default=None, help="allowed ABCD execution relations")
-    parser.add_argument('--min_goal_distance', type=int, default=None, help="minimum circular consecutive-goal Manhattan distance")
+    parser.add_argument('--min_goal_distance', type=int, default=None, help="minimum goal-to-goal Manhattan distance (generated/fMRI banks enforce it for every pair)")
     parser.add_argument(
         '--fmri_base_configurations',
         type=str,
         default=None,
         help=(
-            "exactly five explicit, familiar base spatial configurations for "
-            "the final scanner-style evaluation; direction/reversal is crossed "
-            "factorially and must not be duplicated in this bank"
+            "optional override containing exactly five familiar base spatial "
+            "configurations for the final scanner-style evaluation; without "
+            "it, a documented synthetic balance-controlled five-base fallback "
+            "is used; direction/reversal is crossed factorially and must not "
+            "be duplicated in this bank"
         ),
     )
     parser.add_argument(
@@ -208,7 +210,7 @@ def parse_args(**kwargs):
         default=0,
         type=int,
         help=(
-            "after training, run once over five explicit base configurations "
+            "after training, run once over five resolved base configurations "
             "x two instruction directions x two execution relations"
         ),
     )
