@@ -2,7 +2,7 @@
 
 The generic RNN agent stores one mapping per environment timestep.  Each
 batched value has shape ``(batch, ...)`` and ABCD trials can finish at
-different times.  This module stacks those records without imposing Jensen's
+different times. This module stacks those records without imposing the main repo's original
 signed-time or fixed-horizon conventions.
 
 Stacked arrays are **time-major**: ``(time, batch, ...)``, matching the order

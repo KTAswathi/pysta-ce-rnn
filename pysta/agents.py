@@ -38,7 +38,7 @@ class BaseAgent(nn.Module):
         """
         
         # pytorch boilerplate
-        super(BaseAgent, self).__init__()
+        super().__init__()
 
         # store some hyperparameters
         self.env = env
@@ -110,8 +110,8 @@ class BaseAgent(nn.Module):
             # positional lists for backwards compatibility:
             #   0: recurrent activity, 1: physical location,
             #   2: the environment's native time coordinate.
-            # Jensen MazeEnv therefore continues to store ``step_num`` in the
-            # third list.  Environments without Jensen planning semantics can
+            # The original MazeEnv therefore continues to store ``step_num`` in the
+            # third list. Environments without those planning semantics can
             # expose their own time coordinate (ABCD uses ``block_timestep``).
             self.all_acts = [[], [], []]
             self.all_acts_time_name = None
@@ -150,7 +150,7 @@ class BaseAgent(nn.Module):
                 policy_loss_mask(), "env.policy_loss_mask()", device
             )
 
-        # Jensen MazeEnv fallback: execution phase and unfinished trials only.
+        # Original MazeEnv fallback: execution phase and unfinished trials only.
         not_finished = self._as_batch_mask(
             ~torch.as_tensor(self.env.finished, dtype=torch.bool),
             "~env.finished",
@@ -170,14 +170,14 @@ class BaseAgent(nn.Module):
             if mask is None:
                 return None
         elif getattr(self.env, "output_format", None) == "allocentric":
-            # Jensen MazeEnv fallback: allocentric outputs denote destination states,
+            # Original MazeEnv fallback: allocentric outputs denote destination states,
             # so only adjacent states may be sampled.
             mask = self.env.adjacency[
                 self.env.batch_inds, self.env.loc, :
             ]
             assert mask.sum(-1).min() >= 2
         else:
-            # Jensen egocentric policies already enumerate valid actions.
+            # Original egocentric policies already enumerate valid actions.
             return None
 
         mask = torch.as_tensor(mask, dtype=dtype, device=device)
@@ -229,7 +229,7 @@ class BaseAgent(nn.Module):
 
     def _activity_time(self):
         """Return an environment-native time label without imposing Maze semantics."""
-        # Preserve the exact legacy coordinate for Jensen environments.  ABCD
+        # Preserve the exact coordinate for legacy environments. ABCD
         # deliberately has no ``step_num`` because it has no planning period;
         # its native coordinate is elapsed time within the recurrent block.
         for name in ("step_num", "block_timestep"):
@@ -243,7 +243,7 @@ class BaseAgent(nn.Module):
         ``all_acts`` retains its historical positional representation.  The
         parallel ``all_acts_metadata`` records the meaning of its third field
         and phase/task-specific state, so consumers need not reinterpret an
-        ABCD block time as Jensen's planning/execution ``step_num``.
+        ABCD block time as the original planning/execution ``step_num``.
         """
         # Old pickled agents and a few legacy analysis scripts may replace
         # ``all_acts`` directly instead of calling reset().  Initialise (or
@@ -363,7 +363,7 @@ class BaseAgent(nn.Module):
             self.env_action = self.action.clone()
             teacher_rows = active
             if not callable(getattr(self.env, "policy_loss_mask", None)):
-                # Exact Jensen fallback: the old agent teacher-forced every row,
+                # Exact original-task fallback: the old agent teacher-forced every row,
                 # including planning/finished rows whose actions were ignored.
                 teacher_rows = torch.ones_like(active)
             if self.force_optimal and torch.any(teacher_rows):
@@ -469,7 +469,7 @@ class BaseAgent(nn.Module):
         if callable(getattr(self.env, "policy_loss_mask", None)):
             corrects[~loss_mask] = torch.nan
         else:
-            # Preserve Jensen's stored planning correctness values; only
+            # Preserve the original stored planning correctness values; only
             # already-finished trials were NaN in the original store format.
             finished = self._as_batch_mask(
                 self.env.finished, "env.finished", self.action.device
@@ -491,7 +491,7 @@ class BaseAgent(nn.Module):
             "corrects": corrects, # whether actions are correct
         }
 
-        # Keep Jensen's established fields when the environment exposes them,
+        # Keep the original task's established fields when the environment exposes them,
         # without requiring them from generic environments.
         if hasattr(self.env, "loc"):
             record["loc"] = self._snapshot_value(self.env.loc)
@@ -654,7 +654,7 @@ class VanillaRNN(BaseAgent):
         self.phi = F.relu # use a ReLU nonlinearity
         
         # initialise BaseAgent
-        super(VanillaRNN, self).__init__(env, **kwargs)
+        super().__init__(env, **kwargs)
         
     @property
     def name(self):
@@ -833,7 +833,7 @@ class LineEmbeddedRNN(VanillaRNN):
                 f"readout_mode must be one of ['global', 'same_end', 'opposite_end'], got {self.readout_mode}"
             )
 
-        super(LineEmbeddedRNN, self).__init__(
+        super().__init__(
             env,
             Nrec=Nrec,
             W_reg=W_reg,
@@ -897,13 +897,13 @@ class LineEmbeddedRNN(VanillaRNN):
                 )
             buffer_names = {group: f"mask_{group}" for group in inds}
         else:
-            # Exact Jensen MazeEnv fallback, retaining its original flags and
+            # Exact original MazeEnv fallback, retaining its legacy flags and
             # public buffer names for existing models and analyses.
             expected_groups = {"loc", "goal", "walls"}
             if set(inds) != expected_groups:
                 raise ValueError(
                     "An environment without input_routing() or "
-                    "cortical_input_routing() must expose Jensen MazeEnv groups "
+                    "cortical_input_routing() must expose original MazeEnv groups "
                     f"{sorted(expected_groups)}, got {sorted(inds)}."
                 )
             routing = {
@@ -1116,7 +1116,7 @@ class LineEmbeddedRNN(VanillaRNN):
         for iter_ in range(network_iters):
             rec_noise = torch.randn(batch, self.Nrec, 1, device=self.z0.device) * self.rec_noise
 
-            # Apply the validated combined routing mask. Whole-object Jensen
+            # Apply the validated combined routing mask. Whole-object legacy
             # checkpoints created before generic routing have the three legacy
             # masks but no ``mask_input`` buffer, so retain a read-only fallback.
             obs_col = observation[..., None]  # (batch, Nin, 1)
@@ -1212,7 +1212,7 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
             else list(anchor_area_names)
         )
 
-        super(CorticallyEmbeddedRNN, self).__init__(
+        super().__init__(
             env,
             Nrec=Nrec,
             W_reg=W_reg,
@@ -1309,10 +1309,10 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
                 f"0..{self.Nrec - 1}."
             )
 
-        print("\nUsing auto anchor/input zone from embedding:")
+        print("\nUsing anatomical Area-25-facing anchor seed from embedding:")
         print(f"  {anchor_path}")
-        print(f"  anchor units: {len(anchor_unit_indices)} / {self.Nrec}")
-        print(f"  fraction: {len(anchor_unit_indices) / float(self.Nrec):.4f}")
+        print(f"  seed units: {len(anchor_unit_indices)} / {self.Nrec}")
+        print(f"  seed fraction: {len(anchor_unit_indices) / float(self.Nrec):.4f}")
 
         return torch.tensor(anchor_unit_indices, dtype=torch.long)
 
@@ -1324,10 +1324,24 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
         return mask
 
     def _make_cortical_band_mask_from_unit_indices(self, unit_indices):
-        # exact mask from precomputed anchor/input units
+        """Expand the anatomical anchor seed to the requested local_fraction."""
         mask = torch.zeros(self.Nrec, dtype=torch.float32)
-        unit_indices = torch.as_tensor(unit_indices, dtype=torch.long)
-        mask[unit_indices] = 1.0
+
+        unit_indices = torch.as_tensor(
+            unit_indices,
+            dtype=torch.long,
+            device=self.distance_matrix.device,
+        )
+
+        k = self._local_band_size()
+
+        # distance of every RNN unit to the nearest anatomical anchor-seed unit
+        distance_to_anchor_zone = self.distance_matrix[:, unit_indices].min(dim=1).values
+
+        # k closest cortical units to the Area-25-facing seed zone
+        nearest = torch.argsort(distance_to_anchor_zone)[:k]
+        mask[nearest] = 1.0
+
         return mask
 
     def _choose_anchor_index(self, area_labels):
@@ -1385,6 +1399,11 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
             same_end_mask = self._make_cortical_band_mask_from_unit_indices(
                 auto_anchor_unit_indices
             )
+            print(
+                "  routed local-input units: "
+                f"{int(same_end_mask.sum().item())} / {self.Nrec} "
+                f"(local_fraction={self.local_fraction})"
+            )
 
             # opposite end = unit farthest on average from full input/anchor zone
             mean_distance_to_anchor_zone = self.distance_matrix[
@@ -1392,9 +1411,18 @@ class CorticallyEmbeddedRNN(LineEmbeddedRNN):
             ].mean(dim=1)
             opposite_anchor_idx = int(torch.argmax(mean_distance_to_anchor_zone).item())
 
-            self.anchor_unit_indices = [
+            # anatomical Area-25-facing seed supplied by the embedding
+            self.anatomical_anchor_unit_indices = [
                 int(x) for x in auto_anchor_unit_indices.detach().cpu().numpy()
             ]
+
+            # actual input zone after applying local_fraction
+            self.anchor_unit_indices = (
+                torch.where(same_end_mask > 0)[0]
+                .detach()
+                .cpu()
+                .tolist()
+            )
 
         else:
             # original behaviour: define anchor by sampled parcel labels

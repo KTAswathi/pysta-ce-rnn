@@ -1,7 +1,7 @@
 """Human 7T-fMRI ABCD instruction-and-navigation task.
 
 This module implements the behavioural state machine used for the human ABCD
-task without depending on Jensen's :class:`~pysta.envs.MazeEnv`.  A complete
+task without depending on the main repo's original :class:`~pysta.envs.MazeEnv`. A complete
 environment episode is one block: sequential instruction followed by a
 continuous execution of a circular four-goal sequence for ``num_loops`` loops.
 
@@ -42,9 +42,9 @@ EXECUTION_RELATION_NAMES = ("SAME", "REVERSE")
 SAME, REVERSE = range(2)
 
 
-# Synthetic, PDF-controlled fallback for the final scanner-style evaluation.
-# These are NOT Svenja Küchenhoff's coordinates, which are not reported in the
-# supplied PDFs.  The row-major location IDs use the grid shown above.  This
+# Synthetic, fallback for the final scanner-style evaluation.
+# These are NOT original task coordinates from the laboratory experiment, which are not reported in the
+# paper. The row-major location IDs use the grid shown above.  This
 # deterministic bank satisfies the reported all-pairs Manhattan separation,
 # has five distinct circular route classes and no direct reversal duplicates,
 # and gives the mathematically best possible distribution of 20 goal
@@ -58,7 +58,6 @@ SAME, REVERSE = range(2)
 # Supply --fmri_base_configurations to replace this modelling fallback when
 # the exact experimental coordinates become available.
 DEFAULT_FMRI_BASE_CONFIGURATIONS = (
-    (0, 2, 4, 8),
     (2, 6, 8, 0),
     (5, 1, 3, 7),
     (6, 8, 0, 4),
@@ -233,7 +232,7 @@ def configuration_bank_statistics(configurations) -> dict[str, object]:
 
     The reported path length is the Manhattan distance for each of the four
     circular goal-to-goal transitions.  This is the statistic that can be
-    compared with the PDF's reported mean of approximately 2.6 once the exact
+    compared with the paper's reported mean of approximately 2.6 once the exact
     scanner configurations are supplied explicitly.
     """
     bank = parse_configurations(configurations)
@@ -308,7 +307,7 @@ def configuration_bank_statistics(configurations) -> dict[str, object]:
 def validate_fmri_configuration_bank(configurations) -> dict[str, object]:
     """Validate the structural controls of an explicit ten-config scanner bank.
 
-    The PDFs do not report the ten coordinates, so this helper validates an
+    The paper does not report the ten coordinates, so this helper validates an
     explicitly supplied bank rather than embedding invented coordinates.  It
     enforces ten unique mappings arranged as five direct inverse pairs and the
     reported all-pairs separation, then returns balance/path-length statistics
@@ -352,7 +351,7 @@ def generate_synthetic_fmri_configuration_bank(
 ) -> tuple[tuple[int, int, int, int], ...]:
     """Construct a labelled synthetic ten-config bank with an explicit trade-off.
 
-    This is **not** Svenja's unreported coordinate set. It exhaustively selects
+    This is **not** the original task coordinates from the laboratory experiment. It exhaustively selects
     five distinct physical-cycle classes and includes each direct inverse.
     Under the open-grid/all-pairs assumptions, location balance and an exact
     circular mean of 2.6 cannot both be optimal, so callers must choose either
@@ -991,7 +990,7 @@ class ABCDFMRIEnv:
                 ):
                     if self.started_on_first_goal[batch_index]:
                         # Explicit modelling rule for the optional true-uniform
-                        # start policy; the PDF does not specify this edge case.
+                        # start policy; the references does not specify this edge case.
                         self.latest_rew[batch_index] = 1.0
                         self.reward_event[batch_index] = True
                         self.successful_goal_count[batch_index] += 1

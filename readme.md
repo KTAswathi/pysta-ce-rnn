@@ -2,18 +2,19 @@
 
 (Ongoing research) code for training and analysing cortically embedded recurrent neural networks for planning representations.
 
-This repository is adapted from Kris Jensen’s spacetime attractor/RNN codebase and is currently being extended to test whether planning representations in RNNs can develop spatial gradients when the recurrent units are embedded on an mPFC cortical surface.
+This repository is adapted from an earlier spacetime-attractor/RNN codebase and is currently being extended to test whether planning representations in RNNs can develop spatial gradients when recurrent units are embedded on an mPFC cortical surface.
 
 The project is under active development
 
 ## Human 7T-fMRI ABCD task
 
 The human ABCD instruction/navigation task is available alongside the original
-Jensen maze as `--task abcd_fmri`. One episode is one complete recurrent block:
+maze task; select ABCD with `--task abcd_fmri`. One episode is one complete
+recurrent block:
 four locations are shown sequentially (twice by default), then the agent
 navigates continuously through five circular four-goal loops with one explicit
 reward-dwell timestep after every correct goal. The environment is implemented
-in `pysta/abcd_env.py`; the Jensen `MazeEnv` remains the default task.
+in `pysta/abcd_env.py`; the original `MazeEnv` remains the default task.
 
 The ABCD observation is exactly 24 channels:
 
@@ -33,6 +34,17 @@ boundary attempts remain possible model errors.
 Task-conditioned defaults use the preserved human N480
 `mpfc_projected_mask_linear0p1` cortical embedding and a global readout. For
 full-block BPTT the ABCD batch default is 8 (the Maze default remains 200).
+The ABCD local-input fraction is `1/4`: both spatial observation groups route
+to the same 120 of 480 units proximal to the fixed Area-25-facing anatomical
+seed. Context groups remain global. The corresponding maze default remains
+`1/6`.
+
+The direct mechanism controls are deliberately separate: `local_fraction`
+sets the spatial-input footprint, `use_local_init` switches the geodesic
+recurrent initialization on/off, `line_decay` affects that initialization only,
+and `dist_reg` weights the geodesic recurrent penalty during optimization. The
+legacy `localize_*` flags do not alter ABCD semantic routing. `--help` tags every
+argument by ABCD applicability and marks ignored training/routing options.
 The ordinary `familiar` evaluation mode is a training-time performance monitor;
 `heldout` is the separate strict schema-generalisation monitor. For example
 (this starts real N480 training, so choose resources deliberately):
@@ -102,6 +114,16 @@ records, while `extract_navigation_trajectories` constructs arbitrary future
 physical-location lags using navigation actions only (instruction and reward
 dwell timesteps are ignored). It intentionally does not compute or reinterpret
 the existing planning/Csubs analyses.
+
+The current proof-of-concept analysis pipeline is documented in
+`scripts/ABCD_task/README.md`. It collects two autonomous frozen-model repeats
+and produces three deliberately distinct summaries: nuisance-controlled raw
+activity, cross-fitted Csubs decoder allocation, and local reference-matched
+RSA. All outputs for one checkpoint live under a single
+`abcd_reference_analysis/` directory. Saved ABCD runs also write portable
+resolved kwargs and an exact CPU best-checkpoint state dict so the collector
+can reconstruct future mechanism-sweep models without loading a pickled
+training object.
 
 ## Installation
 

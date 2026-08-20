@@ -3,6 +3,7 @@ import numpy as np
 import time
 import pickle
 import copy
+import json
 import os
 import sys
 import torch
@@ -20,6 +21,63 @@ def _make_rnn(env, kwargs):
     raise ValueError(f"Unknown model_type: {kwargs['model_type']}")
 
 
+def _json_safe_training_value(value):
+    """Convert resolved training arguments to lossless JSON-compatible values."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, np.generic):
+        return _json_safe_training_value(value.item())
+    if isinstance(value, np.ndarray):
+        return [_json_safe_training_value(item) for item in value.tolist()]
+    if torch.is_tensor(value):
+        return _json_safe_training_value(value.detach().cpu().tolist())
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe_training_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_training_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(
+            (_json_safe_training_value(item) for item in value),
+            key=repr,
+        )
+    raise TypeError(
+        "ABCD portable constructor arguments must be JSON-compatible; "
+        f"unsupported value {value!r} of type {type(value).__name__}."
+    )
+
+
+def _write_abcd_portable_kwargs(savename, kwargs):
+    """Save resolved ABCD constructor arguments using the analysis filename contract."""
+    destination = f"{savename}_portable_kwargs.json"
+    payload = _json_safe_training_value(kwargs)
+    with open(destination, "w", encoding="utf8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True, allow_nan=False)
+        stream.write("\n")
+    return destination
+
+
+def _save_best_checkpoint(rnn, savename, *, task):
+    """Save the established checkpoint plus an exact portable ABCD state dict."""
+    checkpoint_path = f"{savename}_best.pt"
+    torch.save(rnn, checkpoint_path)
+    portable_state_path = None
+    if task == "abcd_fmri":
+        portable_state_path = f"{savename}_best_portable_state_dict.pt"
+        # CPU clones make this artifact device-independent without mutating the
+        # live model or changing the established whole-object checkpoint.
+        portable_state = {
+            name: value.detach().cpu().clone()
+            for name, value in rnn.state_dict().items()
+        }
+        torch.save(portable_state, portable_state_path)
+    return checkpoint_path, portable_state_path
+
+
 def _stored_execution_accuracy(store):
     """Calculate accuracy only where the environment requests policy loss."""
     corrects = []
@@ -27,7 +85,7 @@ def _stored_execution_accuracy(store):
     for state in store:
         mask = state.get("policy_loss_mask", state.get("loss_mask"))
         if mask is None:
-            # Backward-compatible fallback for stores made by Jensen's agent.
+            # Backward-compatible fallback for stores made by the original agent.
             if state.get("step_num", -1) < 0:
                 continue
             mask = ~state["finished"]
@@ -579,6 +637,8 @@ def main_train(kwargs):
         
     if kwargs["save_results"]:
         os.makedirs(f"{dirname}", exist_ok = True)
+        if task == "abcd_fmri":
+            _write_abcd_portable_kwargs(savename, kwargs)
 
     # instantiate optimizer and some variables to keep track of
     optim = torch.optim.Adam(rnn.parameters(), lr=kwargs["lrate"])
@@ -607,14 +667,14 @@ def main_train(kwargs):
                     metrics["epoch"] = epoch
                     eval_metrics.append(metrics)
                 else:
-                    # Preserve Jensen's original same-environment evaluation.
+                    # Preserve the original same-environment evaluation.
                     loss, acc = rnn.eval(num_eval = kwargs["num_eval"])
                 all_losses.append(loss)
                 all_accs.append(acc)
                 if loss <= best_loss:
                     best_loss = loss
                     if kwargs["save_results"]:
-                        torch.save(rnn, f"{savename}_best.pt")
+                        _save_best_checkpoint(rnn, savename, task=task)
                 
                 losses = [np.round(l.item(), 4) for l in [rnn.acc_loss, rnn.ent_loss, rnn.weight_loss, rnn.rate_loss]]
                 print(epoch, loss, acc, np.round((time.time() - t0)/60, 2), best_loss, losses)
