@@ -58,6 +58,7 @@ SAME, REVERSE = range(2)
 # Supply --fmri_base_configurations to replace this modelling fallback when
 # the exact experimental coordinates become available.
 DEFAULT_FMRI_BASE_CONFIGURATIONS = (
+    (0, 2, 4, 8),
     (2, 6, 8, 0),
     (5, 1, 3, 7),
     (6, 8, 0, 4),
