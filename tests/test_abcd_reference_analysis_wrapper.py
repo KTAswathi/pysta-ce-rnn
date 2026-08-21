@@ -86,11 +86,23 @@ def _make_managed_run(
     if schema_version >= 2:
         import torch
 
+        rng_dtype = getattr(torch, "uint32", torch.int64)
         torch.save(
             {
+                "schema_version": schema_version,
                 "checkpoint_kind": "latest",
                 "config_hash": CONFIG_HASH,
                 "completed_updates": completed_updates,
+                "model_state_dict": {
+                    "weight": torch.ones(1, dtype=torch.float32),
+                },
+                # This mirrors the dtype responsible for the real cross-version
+                # failure: Torch 2.2 cannot deserialize a uint32 RNG tensor
+                # written by Torch 2.6, although the scalar header is readable
+                # without unpickling either the RNG state or model tensors.
+                "rng_state": {
+                    "numpy_uint32_like": torch.ones(4, dtype=rng_dtype),
+                },
             },
             run_dir / "checkpoints" / "latest.pt",
         )
@@ -752,6 +764,45 @@ def test_schema_v2_managed_folder_is_accepted(monkeypatch, tmp_path):
     _invoke(monkeypatch, tmp_path, runner, "--only", "collect")
 
     assert _stage_names(runner.calls) == ["collect"]
+
+
+def test_schema_v2_resolution_never_deserializes_latest_tensor_payload(
+    monkeypatch, tmp_path
+):
+    """The completion guard must remain usable across Torch dtype versions."""
+
+    run_dir = _make_managed_run(tmp_path, schema_version=2)
+    import torch
+
+    def forbidden_torch_load(*_args, **_kwargs):
+        raise AssertionError("latest.pt tensors must not be deserialized")
+
+    monkeypatch.setattr(torch, "load", forbidden_torch_load)
+
+    paths = wrapper.resolve_managed_run(RUN_NAME, repo_root=tmp_path)
+
+    assert paths.run_dir == run_dir.resolve()
+    assert paths.checkpoint == (run_dir / "checkpoints" / "best.pt").resolve()
+
+
+def test_malformed_native_latest_header_is_rejected(tmp_path):
+    run_dir = _make_managed_run(tmp_path, schema_version=2)
+    import torch
+
+    # Omit completed_updates: a valid ZIP/pickle container must not be enough
+    # to certify that native managed training reached its configured boundary.
+    torch.save(
+        {
+            "schema_version": 2,
+            "checkpoint_kind": "latest",
+            "config_hash": CONFIG_HASH,
+            "model_state_dict": {"weight": torch.ones(1)},
+        },
+        run_dir / "checkpoints" / "latest.pt",
+    )
+
+    with pytest.raises(ValueError, match="missing.*completed_updates"):
+        wrapper.resolve_managed_run(RUN_NAME, repo_root=tmp_path)
 
 
 def test_incomplete_native_managed_run_is_rejected_before_analysis(

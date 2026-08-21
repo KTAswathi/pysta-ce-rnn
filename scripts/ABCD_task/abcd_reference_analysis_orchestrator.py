@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import json
 import os
+import pickletools
 import re
 import subprocess
 import sys
@@ -236,12 +237,13 @@ def _validate_frozen_managed_run(
             f"can be verified before analysis: {latest}"
         )
     try:
-        import torch
-
-        payload = torch.load(latest, map_location="cpu", weights_only=True)
+        payload = _read_managed_checkpoint_header(latest)
     except Exception as error:
-        raise ValueError(f"Could not safely inspect managed latest.pt: {latest}") from error
-    if not isinstance(payload, Mapping) or payload.get("checkpoint_kind") != "latest":
+        raise ValueError(
+            f"Could not safely inspect managed latest.pt: {latest}. "
+            f"Underlying error: {type(error).__name__}: {error}"
+        ) from error
+    if payload.get("checkpoint_kind") != "latest":
         raise ValueError(f"Not a managed latest checkpoint: {latest}")
     completed = int(payload.get("completed_updates", -1))
     if payload.get("config_hash") != config_hash.get("full"):
@@ -252,6 +254,78 @@ def _validate_frozen_managed_run(
             f"change: completed_updates={completed}, configured={expected_updates}, "
             f"run={run_dir}."
         )
+
+
+def _read_managed_checkpoint_header(path: Path) -> dict[str, object]:
+    """Read scalar managed metadata without loading tensors or executing pickle.
+
+    Managed ``latest.pt`` archives may contain optimizer/RNG tensor dtypes that
+    older Torch versions cannot deserialize even with ``weights_only=True``.
+    The completion guard does not need those objects: collection uses
+    ``best.pt``.  This routine validates the ZIP CRCs and uses ``pickletools``
+    (which disassembles but never executes pickle opcodes) to read the four
+    scalar header fields written before ``model_state_dict`` by
+    :func:`pysta.run_manager.checkpoint_payload`.
+    """
+
+    required = {
+        "schema_version",
+        "checkpoint_kind",
+        "config_hash",
+        "completed_updates",
+    }
+    string_ops = {"BINUNICODE", "SHORT_BINUNICODE", "UNICODE", "STRING"}
+    integer_ops = {"BININT", "BININT1", "BININT2", "INT", "LONG", "LONG1", "LONG4"}
+    memo_ops = {"BINPUT", "LONG_BINPUT", "PUT", "MEMOIZE"}
+
+    if path.stat().st_size <= 0 or not zipfile.is_zipfile(path):
+        raise ValueError("checkpoint is not a non-empty PyTorch ZIP archive")
+    with zipfile.ZipFile(path, "r") as archive:
+        bad_member = archive.testzip()
+        if bad_member is not None:
+            raise ValueError(f"checkpoint ZIP member {bad_member!r} failed CRC")
+        pickle_members = [
+            name
+            for name in archive.namelist()
+            if name == "data.pkl" or name.endswith("/data.pkl")
+        ]
+        if len(pickle_members) != 1:
+            raise ValueError(
+                f"expected one data.pkl member, found {len(pickle_members)}"
+            )
+        serialized = archive.read(pickle_members[0])
+    if len(serialized) > 16 * 1024 * 1024:
+        raise ValueError("managed checkpoint pickle header exceeds 16 MiB")
+
+    operations = list(pickletools.genops(serialized))
+    result: dict[str, object] = {}
+    for index, (operation, argument, _position) in enumerate(operations):
+        if operation.name in string_ops and argument == "model_state_dict":
+            break
+        if operation.name not in string_ops or argument not in required:
+            continue
+        if str(argument) in result:
+            raise ValueError(f"duplicate managed header field {argument!r}")
+        cursor = index + 1
+        while cursor < len(operations) and operations[cursor][0].name in memo_ops:
+            cursor += 1
+        if cursor >= len(operations):
+            raise ValueError(f"header field {argument!r} has no value")
+        value_operation, value, _ = operations[cursor]
+        if argument in {"checkpoint_kind", "config_hash"}:
+            if value_operation.name not in string_ops or not isinstance(value, str):
+                raise ValueError(f"header field {argument!r} is not a string")
+            result[str(argument)] = value
+        else:
+            if value_operation.name not in integer_ops or isinstance(value, bool):
+                raise ValueError(f"header field {argument!r} is not an integer")
+            result[str(argument)] = int(value)
+        if result.keys() >= required:
+            break
+    missing = required.difference(result)
+    if missing:
+        raise ValueError(f"managed checkpoint header is missing {sorted(missing)}")
+    return result
 
 
 def _validate_folder_name(folder_name: str) -> str:
