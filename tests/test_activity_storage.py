@@ -71,7 +71,7 @@ def test_abcd_all_activity_uses_native_block_time_and_phase_metadata(agent_class
     assert any(index == -1 for index in navigation_indices)
 
 
-def test_jensen_all_activity_keeps_legacy_step_num_coordinate():
+def test_original_task_all_activity_keeps_legacy_step_num_coordinate():
     env = MazeEnv(
         side_length=2,
         max_steps=1,

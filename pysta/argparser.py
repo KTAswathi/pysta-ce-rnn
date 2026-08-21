@@ -149,7 +149,7 @@ def parse_args(**kwargs):
     # training args
     parser.add_argument('--batch_size', type=int, default=None, help=_tagged(ABCD_AND_MAZE, "training batch size (task default: maze=200, ABCD=8)"))
     parser.add_argument('--seed', type=int, default=0, help=_tagged(ABCD_AND_MAZE, "model/training random seed; also the default ABCD training-task seed"))
-    parser.add_argument('--overwrite', default=0, type=int, help=_tagged(ABCD_AND_MAZE, "allow overwriting an existing model with the same name"))
+    parser.add_argument('--overwrite', default=0, type=int, help=_tagged(ABCD_AND_MAZE, "allow overwriting an existing legacy-layout model; managed --run_name directories never overwrite"))
     parser.add_argument('--eval_freq', type=int, default=200, help=_tagged(ABCD_AND_MAZE, "training batches between evaluation/checkpoint operations"))
     parser.add_argument('--num_eval', type=int, default=10, help=_tagged(ABCD_AND_MAZE, "evaluation batches/blocks per monitoring operation"))
     parser.add_argument(
@@ -166,6 +166,24 @@ def parse_args(**kwargs):
     parser.add_argument('--prefix', type=str, default="", help=_tagged(ABCD_AND_MAZE, "optional prefix for the saved model name"))
     parser.add_argument('--lrate', type=float, default=None, help=_tagged(ABCD_AND_MAZE, "Adam learning rate (task default: maze=3e-4, ABCD=1e-4)"))
     parser.add_argument('--save_results', type=int, default=1, help=_tagged(ABCD_AND_MAZE, "whether to save checkpoints and training metadata"))
+    parser.add_argument(
+        '--run_name',
+        type=str,
+        default=None,
+        help=_tagged(
+            ABCD_TASK,
+            "short human-readable name enabling the managed models/abcd_fmri/<name>_<config-hash>/ layout; omitted preserves the legacy layout",
+        ),
+    )
+    parser.add_argument(
+        '--resume',
+        default=0,
+        type=int,
+        help=_tagged(
+            ABCD_TASK,
+            "resume an interrupted managed --run_name launch from checkpoints/latest.pt; the exact resolved configuration must match",
+        ),
+    )
 
     # ABCD fMRI-task arguments. They are harmless extras for MazeEnv, whose
     # constructor already accepts unused keyword arguments. Configuration
@@ -262,6 +280,7 @@ def parse_args(**kwargs):
         "localize_rew_input",
         "localize_wall_input",
         "run_final_fmri_evaluation",
+        "resume",
     ]
 
     for parameter in bool_parameters:

@@ -8,6 +8,7 @@ import os
 import sys
 import torch
 import pysta
+from pysta import run_manager
 
 
 def _make_rnn(env, kwargs):
@@ -618,17 +619,65 @@ def main_train(kwargs):
     rnn = _make_rnn(env, kwargs).to(device)
 
     # create some filenames and directories
-    model_namespace = f"{env.name}/{rnn.name}"
-    if task == "abcd_fmri":
-        # Best-checkpoint selection depends on the evaluation configuration
-        # set, so keep familiar- and held-out-selected runs unambiguous on disk.
-        model_namespace = f"{model_namespace}/evaluation_{evaluation_mode}"
-    dirname = f"{pysta.utils.basedir}/models/{model_namespace}"
-    savename = f"{dirname}/{kwargs['prefix']}model{kwargs['seed']}"
+    managed_run = kwargs.get("run_name") is not None
+    resume_managed = bool(kwargs.get("resume", False))
+    run_dir = None
+    run_document = None
+    managed_resume_provenance_hash = None
+    if managed_run:
+        if task != "abcd_fmri":
+            raise ValueError("--run_name is currently supported only for --task abcd_fmri.")
+        if not kwargs.get("save_results", True):
+            raise ValueError("--run_name requires --save_results 1.")
+        if kwargs.get("prefix"):
+            raise ValueError("--prefix is a legacy-layout option; use --run_name alone.")
+        if kwargs.get("overwrite"):
+            raise ValueError(
+                "Managed run directories never overwrite; use --resume 1 for an "
+                "exact interrupted run or choose another --run_name/configuration."
+            )
+        if int(kwargs["num_epochs"]) < 1:
+            raise ValueError("Managed training requires --num_epochs >= 1.")
+        training_config = run_manager.build_training_config(
+            kwargs,
+            env,
+            rnn,
+            repo_root=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+            eval_env=eval_env,
+            fmri_factorial_schedule=fmri_factorial_schedule,
+        )
+        launch_controls = {
+            key: kwargs.get(key)
+            for key in sorted(run_manager.NON_CONFIG_ARGUMENTS)
+        }
+        launch_controls["training_device"] = str(device)
+        run_dir, run_document = run_manager.prepare_run_directory(
+            basedir=pysta.utils.basedir,
+            run_name=kwargs["run_name"],
+            training_config=training_config,
+            launch_controls=launch_controls,
+            resume=resume_managed,
+            repo_root=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        )
+        managed_resume_provenance_hash = run_manager.resume_provenance_hash(
+            run_document
+        )
+        dirname = str(run_dir)
+        savename = None
+    else:
+        if resume_managed:
+            raise ValueError("--resume requires --run_name.")
+        model_namespace = f"{env.name}/{rnn.name}"
+        if task == "abcd_fmri":
+            # Best-checkpoint selection depends on the evaluation configuration
+            # set, so keep familiar- and held-out-selected runs unambiguous on disk.
+            model_namespace = f"{model_namespace}/evaluation_{evaluation_mode}"
+        dirname = f"{pysta.utils.basedir}/models/{model_namespace}"
+        savename = f"{dirname}/{kwargs['prefix']}model{kwargs['seed']}"
     print("Saving to:")
-    print(savename)
+    print(run_dir if managed_run else savename)
 
-    if os.path.isfile(f"{savename}.p"): # if this model already exists, check whether we can overwrite
+    if not managed_run and os.path.isfile(f"{savename}.p"): # if this model already exists, check whether we can overwrite
         if bool(kwargs["overwrite"]):
             print(f"{savename} aleady exists, overwriting!")
         else:
@@ -637,15 +686,74 @@ def main_train(kwargs):
         
     if kwargs["save_results"]:
         os.makedirs(f"{dirname}", exist_ok = True)
-        if task == "abcd_fmri":
+        if task == "abcd_fmri" and not managed_run:
             _write_abcd_portable_kwargs(savename, kwargs)
 
     # instantiate optimizer and some variables to keep track of
     optim = torch.optim.Adam(rnn.parameters(), lr=kwargs["lrate"])
     all_losses, all_accs, eval_metrics = [], [], []
+    validation_history = []
+    managed_validation_metrics = []
     fmri_factorial_metrics = None
     best_loss = np.inf
+    best_update = None
+    start_update = 0
     epoch = -1  # permits a setup/save-only run with num_epochs=0
+    if managed_run and not resume_managed:
+        # Establish an exact update-zero recovery boundary before the first
+        # validation call advances the evaluation environment RNG.
+        run_manager.save_checkpoint(
+            run_dir,
+            run_manager.checkpoint_payload(
+                kind="latest",
+                config_hash=run_document["config_hash"]["full"],
+                resume_provenance_hash=managed_resume_provenance_hash,
+                completed_updates=0,
+                model=rnn,
+                optimizer=optim,
+                best_validation_loss=float(best_loss),
+                best_update=best_update,
+                validation_history=validation_history,
+                env=env,
+                eval_env=eval_env,
+            ),
+        )
+    if managed_run and resume_managed:
+        (
+            start_update,
+            best_loss,
+            best_update,
+            validation_history,
+        ) = run_manager.load_latest_checkpoint(
+            run_dir,
+            expected_config_hash=run_document["config_hash"]["full"],
+            expected_resume_provenance_hash=managed_resume_provenance_hash,
+            model=rnn,
+            optimizer=optim,
+            env=env,
+            eval_env=eval_env,
+            device=device,
+        )
+        all_losses = [float(row["loss"]) for row in validation_history]
+        all_accs = [
+            np.nan if row["accuracy"] is None else float(row["accuracy"])
+            for row in validation_history
+        ]
+        checkpointed_validation_updates = {
+            int(row["update"]) for row in validation_history
+        }
+        managed_validation_metrics = [
+            row
+            for row in run_manager.load_validation_metrics(run_dir)
+            if int(row["update"]) in checkpointed_validation_updates
+        ]
+        run_manager.save_validation_metrics(run_dir, managed_validation_metrics)
+        if start_update > int(kwargs["num_epochs"]):
+            raise ValueError(
+                f"latest.pt has {start_update} completed updates, exceeding "
+                f"configured num_epochs={kwargs['num_epochs']}."
+            )
+        print(f"Resuming managed run after {start_update} completed updates.")
 
     # print training message
     time.sleep(5e-2)
@@ -653,7 +761,12 @@ def main_train(kwargs):
 
     # now run actual training loop
     t0 = time.time()
-    for epoch in range(kwargs["num_epochs"]):
+    elapsed_offset_minutes = (
+        float(validation_history[-1]["elapsed_minutes"])
+        if validation_history
+        else 0.0
+    )
+    for epoch in range(start_update, kwargs["num_epochs"]):
         
         if epoch % kwargs["eval_freq"] == 0:
             with torch.no_grad():
@@ -665,6 +778,7 @@ def main_train(kwargs):
                         evaluation_mode=evaluation_mode,
                     )
                     metrics["epoch"] = epoch
+                    metrics["update"] = epoch
                     eval_metrics.append(metrics)
                 else:
                     # Preserve the original same-environment evaluation.
@@ -673,20 +787,75 @@ def main_train(kwargs):
                 all_accs.append(acc)
                 if loss <= best_loss:
                     best_loss = loss
+                    best_update = epoch
                     if kwargs["save_results"]:
-                        _save_best_checkpoint(rnn, savename, task=task)
+                        if managed_run:
+                            run_manager.save_checkpoint(
+                                run_dir,
+                                run_manager.checkpoint_payload(
+                                    kind="best",
+                                    config_hash=run_document["config_hash"]["full"],
+                                    resume_provenance_hash=managed_resume_provenance_hash,
+                                    completed_updates=epoch,
+                                    model=rnn,
+                                    best_validation_loss=float(best_loss),
+                                    best_update=best_update,
+                                ),
+                            )
+                        else:
+                            _save_best_checkpoint(rnn, savename, task=task)
+
+                if managed_run:
+                    elapsed_minutes = elapsed_offset_minutes + (time.time() - t0) / 60
+                    validation_history.append(
+                        {
+                            "update": int(epoch),
+                            "loss": float(loss),
+                            "accuracy": float(acc),
+                            "best_loss": float(best_loss),
+                            "elapsed_minutes": float(elapsed_minutes),
+                        }
+                    )
+                    run_manager.save_validation_curve(run_dir, validation_history)
+                    managed_validation_metrics.append(dict(metrics))
+                    run_manager.save_validation_metrics(
+                        run_dir, managed_validation_metrics
+                    )
                 
                 losses = [np.round(l.item(), 4) for l in [rnn.acc_loss, rnn.ent_loss, rnn.weight_loss, rnn.rate_loss]]
                 print(epoch, loss, acc, np.round((time.time() - t0)/60, 2), best_loss, losses)
                 sys.stdout.flush()
                 
                 if kwargs["save_results"]:
-                    pickle.dump({"epoch": epoch, "loss": all_losses, "accs": all_accs, "eval_metrics": eval_metrics, "evaluation_mode": evaluation_mode if task == "abcd_fmri" else None, "fmri_factorial_metrics": fmri_factorial_metrics, "rnn": rnn, "best_loss": best_loss, "kwargs": kwargs, "optim": optim}, open(f"{savename}.p", "wb"))
+                    if not managed_run:
+                        pickle.dump({"epoch": epoch, "loss": all_losses, "accs": all_accs, "eval_metrics": eval_metrics, "evaluation_mode": evaluation_mode if task == "abcd_fmri" else None, "fmri_factorial_metrics": fmri_factorial_metrics, "rnn": rnn, "best_loss": best_loss, "kwargs": kwargs, "optim": optim}, open(f"{savename}.p", "wb"))
                 
         optim.zero_grad() # reset gradient accumulator
         loss = rnn.forward() # compute loss
         loss.backward() # compute gradients
         optim.step() # update parameters
+
+        completed_updates = epoch + 1
+        if managed_run and (
+            epoch % kwargs["eval_freq"] == 0
+            or completed_updates == kwargs["num_epochs"]
+        ):
+            run_manager.save_checkpoint(
+                run_dir,
+                run_manager.checkpoint_payload(
+                    kind="latest",
+                    config_hash=run_document["config_hash"]["full"],
+                    resume_provenance_hash=managed_resume_provenance_hash,
+                    completed_updates=completed_updates,
+                    model=rnn,
+                    optimizer=optim,
+                    best_validation_loss=float(best_loss),
+                    best_update=best_update,
+                    validation_history=validation_history,
+                    env=env,
+                    eval_env=eval_env,
+                ),
+            )
 
     if fmri_factorial_schedule is not None:
         _, _, fmri_factorial_metrics = evaluate_abcd_fmri_factorial(
@@ -700,10 +869,13 @@ def main_train(kwargs):
             fmri_factorial_metrics["accuracy"],
             fmri_factorial_metrics["num_blocks"],
         )
+        if managed_run:
+            run_manager.save_final_evaluation(run_dir, fmri_factorial_metrics)
 
     if kwargs["save_results"]:
-        pickle.dump({"epoch": epoch, "loss": all_losses, "accs": all_accs, "eval_metrics": eval_metrics, "evaluation_mode": evaluation_mode if task == "abcd_fmri" else None, "fmri_factorial_metrics": fmri_factorial_metrics, "rnn": rnn, "best_loss": best_loss, "kwargs": kwargs, "optim": optim}, open(f"{savename}.p", "wb"))
-        torch.save(rnn, f"{savename}_final.pt")
+        if not managed_run:
+            pickle.dump({"epoch": epoch, "loss": all_losses, "accs": all_accs, "eval_metrics": eval_metrics, "evaluation_mode": evaluation_mode if task == "abcd_fmri" else None, "fmri_factorial_metrics": fmri_factorial_metrics, "rnn": rnn, "best_loss": best_loss, "kwargs": kwargs, "optim": optim}, open(f"{savename}.p", "wb"))
+            torch.save(rnn, f"{savename}_final.pt")
 
     return rnn
 

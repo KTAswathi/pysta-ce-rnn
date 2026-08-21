@@ -8,6 +8,7 @@ __pycache__/
 /models/
 /figures/
 /data/rnn_analyses/
+/data/abcd_task_analyses/
 
 # Local cortical-embedding artifacts
 /data/embedding/anchor_checks/

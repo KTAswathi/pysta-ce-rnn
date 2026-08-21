@@ -26,9 +26,13 @@ import numpy as np
 import torch
 
 import pysta
+from pysta import run_manager
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+ANALYSIS_PARENT_DIRNAME = "abcd_task_analyses"
+# Kept as a public alias for callers written against the first analysis layout.
+# It is no longer appended to newly resolved output paths.
 ANALYSIS_DIRNAME = "abcd_reference_analysis"
 TRIAL_COLLECTION_DIRNAME = "trial_collection"
 PHASES_PER_GOAL = 3
@@ -158,45 +162,213 @@ def _resolve_path_record(record: Mapping[str, Any] | str | Path) -> Path:
     return Path(str(absolute)).expanduser().resolve()
 
 
+def _managed_run_directory(path: Path | str) -> Path | None:
+    """Return the nearest ancestor implementing the managed-run contract."""
+    path = Path(path).expanduser().resolve()
+    cursor = path if path.is_dir() else path.parent
+    for candidate in (cursor, *cursor.parents):
+        if (candidate / "config.yaml").is_file() and (
+            candidate / "checkpoints"
+        ).is_dir():
+            return candidate
+    return None
+
+
+def resolve_checkpoint_identifier(path: Path | str) -> Path:
+    """Resolve a managed run, checkpoint directory, or checkpoint file.
+
+    A managed run selects ``checkpoints/best.pt`` by default and falls back to
+    ``latest.pt`` only when no best checkpoint exists.  Passing a particular
+    checkpoint file remains authoritative.  Legacy callers may continue to
+    pass their ``*_best.pt`` whole-object checkpoint directly.
+    """
+    source = Path(path).expanduser().resolve()
+    if source.is_file():
+        return source
+    if not source.is_dir():
+        raise FileNotFoundError(source)
+
+    run_dir = _managed_run_directory(source)
+    if run_dir is not None:
+        checkpoint_dir = run_dir / "checkpoints"
+        for name in ("best.pt", "latest.pt"):
+            candidate = checkpoint_dir / name
+            if candidate.is_file():
+                return candidate.resolve()
+        raise FileNotFoundError(
+            f"Managed run has neither checkpoints/best.pt nor latest.pt: {run_dir}"
+        )
+
+    # Directory-form legacy input is intentionally conservative: accepting it
+    # is useful, but an ambiguous directory must never select a model silently.
+    candidates = sorted(source.glob("*_best.pt"))
+    if len(candidates) == 1:
+        return candidates[0].resolve()
+    raise ValueError(
+        f"Could not identify one checkpoint in {source}; found "
+        f"{len(candidates)} legacy '*_best.pt' candidates."
+    )
+
+
+def load_training_config(config_path: Path | str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load a legacy kwargs JSON or managed ``config.yaml``.
+
+    Managed config files are emitted as JSON-compatible YAML 1.2 and keep the
+    reconstruction arguments at ``training_config.arguments``.  A few explicit
+    transitional keys are accepted so imported managed runs remain readable;
+    an arbitrary nested mapping is never guessed.
+    """
+    path = Path(config_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    text = path.read_text(encoding="utf8")
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            import yaml
+        except ImportError as error:  # pragma: no cover - managed files are JSON/YAML
+            raise ValueError(
+                f"{path} is not JSON-compatible YAML and PyYAML is unavailable."
+            ) from error
+        document = yaml.safe_load(text)
+    if not isinstance(document, Mapping):
+        raise ValueError(f"Training configuration must be a mapping: {path}")
+    document = dict(document)
+
+    training = document.get("training_config")
+    if isinstance(training, Mapping) and isinstance(training.get("arguments"), Mapping):
+        arguments = training["arguments"]
+    elif isinstance(document.get("resolved_config"), Mapping):
+        arguments = document["resolved_config"]
+    elif isinstance(document.get("resolved_configuration"), Mapping):
+        arguments = document["resolved_configuration"]
+    elif isinstance(document.get("kwargs"), Mapping):
+        arguments = document["kwargs"]
+    elif "task" in document:
+        # Exact legacy portable kwargs are a flat document.
+        arguments = document
+    else:
+        raise ValueError(
+            "Could not find resolved training arguments at "
+            f"training_config.arguments in {path}."
+        )
+    kwargs = {str(key): value for key, value in dict(arguments).items()}
+    if kwargs.get("task") != "abcd_fmri":
+        raise ValueError(f"Expected task='abcd_fmri', got {kwargs.get('task')!r}.")
+    return kwargs, document
+
+
+def validate_managed_config_identity(
+    document: Mapping[str, Any], config_path: Path | str
+) -> str | None:
+    """Recompute the schema-aware managed identity stored in config.yaml.
+
+    Historical schema-v1 runs hashed their whole ``training_config`` (including
+    then-misplaced provenance).  Schema v2 hashes only its normalized resolved
+    scientific/training configuration.  Transitional test/import documents
+    without a numeric ``schema_version`` retain their pre-existing stored-hash
+    comparison contract.
+    """
+    managed_hash = document.get("config_hash")
+    if not isinstance(managed_hash, Mapping):
+        return None
+    stored_hash = managed_hash.get("full")
+    training_config = document.get("training_config")
+    if "schema_version" not in document:
+        return None if stored_hash is None else str(stored_hash)
+    if not isinstance(stored_hash, str) or not isinstance(training_config, Mapping):
+        raise ValueError(f"Managed config identity is incomplete: {config_path}")
+    schema_version = int(document["schema_version"])
+    recomputed = (
+        run_manager.experiment_config_hash(training_config)
+        if schema_version >= 2
+        else run_manager.sha256_json(training_config)
+    )
+    if stored_hash != recomputed:
+        raise ValueError(
+            "Managed config identity hash mismatch: "
+            f"stored={stored_hash!r}, recomputed={recomputed!r}, "
+            f"config={Path(config_path).expanduser().resolve()}."
+        )
+    return stored_hash
+
+
 def infer_portable_files(checkpoint: Path | str) -> tuple[Path, Path]:
-    """Infer the sibling portable state dict and constructor JSON."""
-    checkpoint = Path(checkpoint).expanduser().resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
+    """Resolve the state/config pair for managed and legacy checkpoints.
+
+    The first returned path can be either the canonical structured managed
+    checkpoint or the legacy portable raw state dict.  The second is the
+    canonical ``config.yaml`` or legacy ``*_portable_kwargs.json``.
+    """
+    checkpoint_path = resolve_checkpoint_identifier(checkpoint)
+    run_dir = _managed_run_directory(checkpoint_path)
+    if run_dir is not None:
+        config_path = run_dir / "config.yaml"
+        if not config_path.is_file():  # defensive; run discovery already checks
+            raise FileNotFoundError(f"Missing managed-run config: {config_path}")
+        return checkpoint_path, config_path.resolve()
+
     suffix = "_best.pt"
-    if not checkpoint.name.endswith(suffix):
-        raise ValueError("Checkpoint identifier must end in '_best.pt'.")
-    stem = checkpoint.name[: -len(suffix)]
-    state_path = checkpoint.with_name(f"{stem}_best_portable_state_dict.pt")
-    kwargs_path = checkpoint.with_name(f"{stem}_portable_kwargs.json")
+    if not checkpoint_path.name.endswith(suffix):
+        raise ValueError(
+            "Legacy checkpoint identifier must end in '_best.pt'; managed "
+            "runs use checkpoints/best.pt or latest.pt."
+        )
+    stem = checkpoint_path.name[: -len(suffix)]
+    state_path = checkpoint_path.with_name(f"{stem}_best_portable_state_dict.pt")
+    kwargs_path = checkpoint_path.with_name(f"{stem}_portable_kwargs.json")
     if not state_path.is_file():
         raise FileNotFoundError(f"Missing portable state_dict: {state_path}")
     if not kwargs_path.is_file():
         raise FileNotFoundError(f"Missing portable kwargs JSON: {kwargs_path}")
-    return state_path, kwargs_path
+    return state_path.resolve(), kwargs_path.resolve()
 
 
 def resolve_analysis_root(
     checkpoint: Path | str,
     output_dir: Path | str | None = None,
 ) -> Path:
-    """Resolve the model-specific ``abcd_reference_analysis`` root."""
+    """Resolve ``data/abcd_task_analyses/<checkpoint-folder-name>``.
+
+    Managed checkpoints use the unique managed run-directory basename exactly.
+    A short path hash disambiguates old checkpoints that have the same filename
+    in different legacy model directories.
+    """
     if output_dir is not None:
         return Path(output_dir).expanduser().resolve()
-    checkpoint = Path(checkpoint).expanduser().resolve()
-    repo_root = Path(pysta.basedir).resolve()
-    try:
-        model_relative = checkpoint.parent.relative_to(repo_root / "models")
-    except ValueError:
-        model_relative = Path(checkpoint.parent.name)
-    return (
-        repo_root
-        / "data"
-        / "rnn_analyses"
-        / model_relative
-        / checkpoint.stem
-        / ANALYSIS_DIRNAME
-    )
+    checkpoint = resolve_checkpoint_identifier(checkpoint)
+    repo_root = Path(pysta.utils.basedir).resolve()
+    run_dir = _managed_run_directory(checkpoint)
+    if run_dir is not None:
+        folder_name = run_dir.name
+    else:
+        path_hash = hashlib.sha256(str(checkpoint.parent).encode("utf8")).hexdigest()[:10]
+        folder_name = f"{checkpoint.stem}_{path_hash}"
+    return repo_root / "data" / ANALYSIS_PARENT_DIRNAME / folder_name
+
+
+def resolve_existing_analysis_root(path_or_root: Path | str) -> Path:
+    """Resolve an existing analysis root from a run/checkpoint/output path."""
+    path = Path(path_or_root).expanduser().resolve()
+    if path.is_file() and path.name == "analysis_manifest.json":
+        return path.parent
+    if path.is_dir() and (path / "analysis_manifest.json").is_file():
+        return path
+    if path.is_dir() and path.name in {
+        TRIAL_COLLECTION_DIRNAME,
+        "raw_activity",
+        "csubs",
+        "local_rsa",
+    } and (path.parent / "analysis_manifest.json").is_file():
+        return path.parent
+    candidate = resolve_analysis_root(path)
+    if not (candidate / "analysis_manifest.json").is_file():
+        raise FileNotFoundError(
+            f"No collected ABCD analysis exists for {path}; expected "
+            f"{candidate / 'analysis_manifest.json'}."
+        )
+    return candidate
 
 
 def resolve_trial_collection_dir(path_or_root: Path | str) -> Path:
@@ -272,10 +444,16 @@ def reconstruct_trained_model(
     """
     state_path = Path(state_path).expanduser().resolve()
     kwargs_path = Path(kwargs_path).expanduser().resolve()
-    with kwargs_path.open("r", encoding="utf8") as stream:
-        kwargs = json.load(stream)
-    if kwargs.get("task") != "abcd_fmri":
-        raise ValueError(f"Expected task='abcd_fmri', got {kwargs.get('task')!r}.")
+    kwargs, config_document = load_training_config(kwargs_path)
+    validated_managed_hash = validate_managed_config_identity(
+        config_document, kwargs_path
+    )
+    schema_version = int(config_document.get("schema_version", 1))
+    validated_execution_provenance_hash = (
+        run_manager.resume_provenance_hash(config_document)
+        if schema_version >= 2
+        else None
+    )
 
     rng_state = capture_global_rng_state()
     try:
@@ -284,7 +462,43 @@ def reconstruct_trained_model(
         torch.manual_seed(seed)
         environment = pysta.tasks.make_environment(kwargs, split="train")
         model = pysta.train_rnn._make_rnn(environment, kwargs)
-        state = torch.load(state_path, map_location="cpu", weights_only=True)
+        payload = torch.load(state_path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, Mapping):
+            raise TypeError(f"Checkpoint payload must be a mapping: {state_path}")
+        if schema_version >= 2:
+            checkpoint_provenance_hash = payload.get("resume_provenance_hash")
+            if checkpoint_provenance_hash != validated_execution_provenance_hash:
+                raise ValueError(
+                    "Managed checkpoint/config execution-provenance mismatch: "
+                    f"checkpoint={checkpoint_provenance_hash!r}, "
+                    f"config={validated_execution_provenance_hash!r}."
+                )
+        if isinstance(payload.get("model_state_dict"), Mapping):
+            state = payload["model_state_dict"]
+        elif isinstance(payload.get("state_dict"), Mapping):
+            state = payload["state_dict"]
+        elif payload and all(torch.is_tensor(value) for value in payload.values()):
+            # Legacy portable artifacts (and explicitly unhashed transitional
+            # imports) may be raw state dictionaries.
+            state = payload
+        else:
+            raise ValueError(
+                "Checkpoint contains neither model_state_dict/state_dict nor "
+                f"a raw tensor state dictionary: {state_path}"
+            )
+
+        managed_hash = validated_managed_hash
+        checkpoint_hash = payload.get("config_hash")
+        if managed_hash is not None:
+            if checkpoint_hash is None:
+                raise ValueError(
+                    f"Managed checkpoint is missing config_hash: {state_path}"
+                )
+            if str(checkpoint_hash) != str(managed_hash):
+                raise ValueError(
+                    "Managed checkpoint/config hash mismatch: "
+                    f"checkpoint={checkpoint_hash!r}, config={managed_hash!r}."
+                )
         result = model.load_state_dict(state, strict=True)
         if result.missing_keys or result.unexpected_keys:
             raise RuntimeError(
@@ -984,16 +1198,28 @@ def build_analysis_manifest(
     geometry = dict(build_geometry_manifest(model) if geometry is None else geometry)
     cortical_mechanism = build_cortical_mechanism_manifest(model)
     num_locations = int(getattr(model.env, "num_locs"))
+    checkpoint_path = Path(checkpoint).expanduser().resolve()
+    is_best = checkpoint_path.name == "best.pt" or checkpoint_path.name.endswith(
+        "_best.pt"
+    )
+    checkpoint_role = "best validation checkpoint" if is_best else "latest checkpoint"
+    run_dir = _managed_run_directory(checkpoint_path)
     manifest = {
         "schema": "abcd_reference_analysis/v1",
         "analysis_label": "ABCD reference-matched proof-of-concept mechanistic analysis",
         "model_description": (
-            f"best-performing training-seed-{int(kwargs['seed'])} checkpoint; "
+            f"training-seed-{int(kwargs['seed'])} {checkpoint_role}; "
             "training completion is not implied"
         ),
         "analysis_root": _path_record(analysis_root, hash_file=False),
         "source": {
             "checkpoint_identifier": _path_record(checkpoint),
+            "managed_run_directory": (
+                _path_record(run_dir, hash_file=False) if run_dir is not None else None
+            ),
+            "model_state_artifact": _path_record(portable_state),
+            "resolved_config": _path_record(portable_kwargs),
+            # Backward-compatible field names used by the first collector.
             "portable_state_dict": _path_record(portable_state),
             "portable_kwargs": _path_record(portable_kwargs),
             "loaded_state_dict_sha256": state_dict_sha256(model),

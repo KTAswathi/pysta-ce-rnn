@@ -652,7 +652,7 @@ def test_familiar_evaluation_is_autonomous_records_routes_and_restores_training_
     assert agent.greedy is False
 
 
-def test_jensen_maze_and_legacy_routing_still_run(monkeypatch):
+def test_original_maze_and_legacy_routing_still_run(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train"])
     defaults = pysta.argparser.parse_args()
     assert defaults["task"] == "maze"

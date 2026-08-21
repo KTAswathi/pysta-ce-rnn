@@ -30,6 +30,7 @@ from scripts.ABCD_task.abcd_analysis_common import (
     file_sha256,
     load_analysis_geometry,
     load_normalized_repeats as load_common_normalized_repeats,
+    resolve_existing_analysis_root,
 )
 
 try:
@@ -482,6 +483,7 @@ def run_analysis(
     n_permutations: int,
     permutation_seed: int,
 ) -> Path:
+    analysis_root = resolve_existing_analysis_root(analysis_root)
     data = load_normalized_repeats(analysis_root)
     geometry = _load_geometry(analysis_root)
     output_dir = analysis_root / "csubs"
@@ -631,7 +633,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cross-fitted Csubs at ABCD normalized future-progress horizons."
     )
-    parser.add_argument("analysis_root", type=Path)
+    parser.add_argument(
+        "analysis_root",
+        type=Path,
+        help=(
+            "Collected analysis root, managed run directory, canonical "
+            "checkpoint, or legacy checkpoint."
+        ),
+    )
     parser.add_argument("--n-permutations", type=int, default=1000)
     parser.add_argument("--permutation-seed", type=int, default=881)
     parser.add_argument("--device", default="auto")

@@ -19,7 +19,8 @@ def test_production_defaults_encode_one_full_n480_training_step():
     assert args.iters_per_action == 10
     assert args.tau == 5.0
     assert args.force_optimal == 1
-    assert args.learning_rate == 3e-4
+    assert args.local_fraction == 0.25
+    assert args.learning_rate == 1e-4
 
 
 def test_tiny_full_block_runs_exactly_one_finite_optimizer_step():

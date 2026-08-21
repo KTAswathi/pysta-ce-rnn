@@ -39,6 +39,7 @@ from scripts.ABCD_task.abcd_analysis_common import (
     infer_portable_files,
     reconstruct_trained_model,
     resolve_analysis_root,
+    resolve_checkpoint_identifier,
     save_normalized_navigation,
     state_dict_sha256,
     write_json,
@@ -204,7 +205,7 @@ def collect_reference_trials(
     *,
     output_dir: Path | None = None,
 ) -> Path:
-    checkpoint = checkpoint.expanduser().resolve()
+    checkpoint = resolve_checkpoint_identifier(checkpoint)
     portable_state, portable_kwargs = infer_portable_files(checkpoint)
     model, kwargs = reconstruct_trained_model(portable_state, portable_kwargs)
     if int(model.Nout) != 4 or int(model.Nin) != 24:
@@ -219,7 +220,6 @@ def collect_reference_trials(
     repeat_seeds = derive_repeat_seeds(int(kwargs["seed"]))
     analysis_root = resolve_analysis_root(checkpoint, output_dir)
     collection_dir = analysis_root / "trial_collection"
-    collection_dir.mkdir(parents=True, exist_ok=True)
     manifest = build_analysis_manifest(
         checkpoint=checkpoint,
         portable_state=portable_state,
@@ -230,7 +230,40 @@ def collect_reference_trials(
         repeat_seeds=repeat_seeds,
         analysis_root=analysis_root,
     )
-    write_json(analysis_root / "analysis_manifest.json", manifest)
+    manifest_path = analysis_root / "analysis_manifest.json"
+    if manifest_path.is_file():
+        with manifest_path.open("r", encoding="utf8") as stream:
+            existing_manifest = json.load(stream)
+        existing_hash = (
+            existing_manifest.get("source", {}).get("loaded_state_dict_sha256")
+        )
+        current_hash = manifest["source"]["loaded_state_dict_sha256"]
+        if existing_hash is not None and str(existing_hash) != str(current_hash):
+            raise RuntimeError(
+                "Refusing to mix checkpoints in an existing analysis root: "
+                f"{analysis_root}. Existing state={existing_hash}, "
+                f"requested state={current_hash}."
+            )
+        existing_config = existing_manifest.get("source", {}).get(
+            "resolved_config",
+            existing_manifest.get("source", {}).get("portable_kwargs", {}),
+        )
+        existing_config_hash = (
+            existing_config.get("sha256")
+            if isinstance(existing_config, dict)
+            else None
+        )
+        current_config_hash = manifest["source"]["resolved_config"].get("sha256")
+        if (
+            existing_config_hash is not None
+            and str(existing_config_hash) != str(current_config_hash)
+        ):
+            raise RuntimeError(
+                "Refusing to mix resolved configurations in an existing "
+                f"analysis root: {analysis_root}."
+            )
+    collection_dir.mkdir(parents=True, exist_ok=True)
+    write_json(manifest_path, manifest)
 
     trained_noise = float(model.rec_noise)
     if trained_noise <= 0:
@@ -283,6 +316,9 @@ def collect_reference_trials(
     qc = {
         "schema": "abcd_reference_trial_collection/v1",
         "checkpoint_sha256": file_sha256(checkpoint),
+        "model_state_artifact_sha256": file_sha256(portable_state),
+        "resolved_config_sha256": file_sha256(portable_kwargs),
+        # Retained aliases keep existing readers backward compatible.
         "portable_state_sha256": file_sha256(portable_state),
         "loaded_state_dict_sha256": state_dict_sha256(model),
         "weights_unchanged": True,
@@ -298,7 +334,14 @@ def collect_reference_trials(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument(
+        "checkpoint",
+        type=Path,
+        help=(
+            "Managed run directory, checkpoints/best.pt, or legacy *_best.pt "
+            "checkpoint. Managed run directories select best.pt by default."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,

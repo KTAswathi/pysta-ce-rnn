@@ -36,7 +36,10 @@ import nibabel as nib
 import numpy as np
 from scipy.stats import rankdata
 
-from scripts.ABCD_task.abcd_analysis_common import load_analysis_geometry
+from scripts.ABCD_task.abcd_analysis_common import (
+    load_analysis_geometry,
+    resolve_existing_analysis_root,
+)
 
 
 PHASE_INSTRUCTION = 0
@@ -1087,7 +1090,7 @@ def run_analysis(
     radius_mm: float = 6.0,
 ) -> Path:
     """Run the complete local RSA and write one NPZ, one CSV and one figure."""
-
+    analysis_root = resolve_existing_analysis_root(analysis_root)
     manifest_path = analysis_root / "analysis_manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(manifest_path)
@@ -1284,7 +1287,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "analysis_root", type=Path,
-        help="Root containing analysis_manifest.json and trial_collection/.",
+        help=(
+            "Collected analysis root, managed run directory, canonical "
+            "checkpoint, or legacy checkpoint."
+        ),
     )
     parser.add_argument("--repeat-1", type=Path, default=None)
     parser.add_argument("--repeat-2", type=Path, default=None)
@@ -1296,13 +1302,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    trial_root = args.analysis_root / "trial_collection"
+    analysis_root = resolve_existing_analysis_root(args.analysis_root)
+    trial_root = analysis_root / "trial_collection"
     repeat_dirs = (
         args.repeat_1 or trial_root / "repeat_01",
         args.repeat_2 or trial_root / "repeat_02",
     )
     output = run_analysis(
-        analysis_root=args.analysis_root,
+        analysis_root=analysis_root,
         repeat_dirs=repeat_dirs,
         embedding_dir=args.embedding_dir,
         surface_path=args.surface_path,

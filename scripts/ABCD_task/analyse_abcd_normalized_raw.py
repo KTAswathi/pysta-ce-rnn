@@ -723,14 +723,28 @@ def weighted_positive_coordinate(
 
 
 def discover_normalized_inputs(path: Path) -> list[Path]:
-    """Resolve a file, repeat directory, or trial_collection directory."""
+    """Resolve normalized stores from collection, analysis, run, or checkpoint."""
     path = path.expanduser().resolve()
     if path.is_file():
-        return [path]
+        if path.suffix.lower() == ".npz":
+            return [path]
+        analysis_root = _load_common_module().resolve_existing_analysis_root(path)
+        path = analysis_root / "trial_collection"
     direct = path / "normalized_navigation.npz"
     if direct.is_file():
         return [direct]
     found = sorted(path.glob("repeat_*/normalized_navigation.npz"))
+    if not found and (path / "analysis_manifest.json").is_file():
+        path = path / "trial_collection"
+        found = sorted(path.glob("repeat_*/normalized_navigation.npz"))
+    if not found:
+        try:
+            analysis_root = _load_common_module().resolve_existing_analysis_root(path)
+        except (FileNotFoundError, ValueError):
+            analysis_root = None
+        if analysis_root is not None:
+            path = analysis_root / "trial_collection"
+            found = sorted(path.glob("repeat_*/normalized_navigation.npz"))
     if not found:
         raise FileNotFoundError(
             f"No normalized_navigation.npz stores found below {path}."
@@ -935,8 +949,8 @@ def main() -> None:
         "trial_collection",
         type=Path,
         help=(
-            "trial_collection directory, repeat directory, or a normalized_"
-            "navigation.npz file"
+            "trial_collection/repeat directory, normalized_navigation.npz, "
+            "collected analysis root, managed run, or checkpoint"
         ),
     )
     parser.add_argument(
@@ -959,15 +973,15 @@ def main() -> None:
 
     result = crossfit_raw_representation(data)
     if args.output_dir is None:
-        collection = args.trial_collection.expanduser().resolve()
+        collection = source_paths[0].parent
+        if collection.name.startswith("repeat_"):
+            collection = collection.parent
         if collection.name == "trial_collection":
             analysis_root = collection.parent
-        elif collection.name.startswith("repeat_"):
-            analysis_root = collection.parent.parent
-        elif collection.is_file() and collection.parent.name.startswith("repeat_"):
-            analysis_root = collection.parent.parent.parent
         else:
-            analysis_root = collection
+            analysis_root = _load_common_module().resolve_existing_analysis_root(
+                args.trial_collection
+            )
         output_dir = analysis_root / "raw_activity"
     else:
         output_dir = args.output_dir.expanduser().resolve()
