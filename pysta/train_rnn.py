@@ -282,6 +282,32 @@ _AGENT_TRANSIENT_STATE_NAMES = (
 )
 
 
+_ABCD_ENV_TRANSIENT_STATE_NAMES = (
+    "configuration",
+    "configuration_index",
+    "instruction_direction",
+    "execution_relation",
+    "presented_sequence",
+    "effective_execution_sequence",
+    "phase",
+    "instruction_presentation_index",
+    "sequence_position",
+    "loop_index",
+    "successful_goal_count",
+    "navigation_step_count",
+    "block_timestep",
+    "reward_event",
+    "latest_rew",
+    "finished",
+    "truncated",
+    "_truncate_after_reward",
+    "loc",
+    "start_location",
+    "started_on_first_goal",
+    "_post_step",
+)
+
+
 def _capture_agent_transient_state(rnn):
     """Retain exact pre-evaluation state objects for transparent restoration."""
     present = {
@@ -302,18 +328,60 @@ def _restore_agent_transient_state(rnn, present, missing):
             delattr(rnn, name)
 
 
+def _capture_abcd_environment_state(env):
+    """Capture exact evaluation-only objects changed by an ABCD rollout."""
+    present = {
+        name: getattr(env, name)
+        for name in _ABCD_ENV_TRANSIENT_STATE_NAMES
+        if hasattr(env, name)
+    }
+    missing = set(_ABCD_ENV_TRANSIENT_STATE_NAMES).difference(present)
+    rng_state = copy.deepcopy(env.rng.bit_generator.state)
+    return present, missing, env.rng, rng_state, int(env._block_counter)
+
+
+def _restore_abcd_environment_state(env, state):
+    """Restore the evaluation environment to its exact pre-validation state."""
+    present, missing, rng, rng_state, block_counter = state
+    for name, value in present.items():
+        setattr(env, name, value)
+    for name in missing:
+        if hasattr(env, name):
+            delattr(env, name)
+    env.rng = rng
+    env.rng.bit_generator.state = copy.deepcopy(rng_state)
+    env._block_counter = int(block_counter)
+
+
 @torch.no_grad()
-def _evaluate_abcd(rnn, eval_env, num_eval, evaluation_mode):
+def _evaluate_abcd(
+    rnn,
+    eval_env,
+    num_eval,
+    evaluation_mode,
+    validation_seed=None,
+):
     """Evaluate complete ABCD blocks on the selected configuration set.
 
     Each call to ``forward`` resets the evaluation environment and runs one
-    complete block. The model is evaluated greedily and on-policy, then its
-    training environment and action-selection flags are restored even if an
-    evaluation block fails.
+    complete block. The fixed validation seed independently replays both the
+    evaluation-environment draws and recurrent-noise draws at every call.
+    Global RNG streams, model caches, the training environment, and the
+    evaluation environment are restored even if an evaluation block fails, so
+    inserting validation cannot change the next training update.
     """
     train_env = rnn.env
     train_greedy = rnn.greedy
     train_force_optimal = rnn.force_optimal
+    device = next(rnn.parameters()).device
+    rng_states = _capture_torch_rng_states(device)
+    numpy_rng_state = np.random.get_state()
+    transient_state, transient_state_missing = _capture_agent_transient_state(rnn)
+    eval_environment_state = _capture_abcd_environment_state(eval_env)
+    if validation_seed is None:
+        # The split-specific evaluation task seed is independent of the model/
+        # training seed and is already part of the immutable run configuration.
+        validation_seed = int(eval_env.seed)
 
     if eval_env.obs_dim != train_env.obs_dim:
         raise ValueError(
@@ -331,6 +399,10 @@ def _evaluate_abcd(rnn, eval_env, num_eval, evaluation_mode):
     environment_blocks = []
     route_consistency_blocks = []
     try:
+        _seed_torch_rng(validation_seed, device)
+        np.random.seed(int(validation_seed))
+        eval_env.rng = np.random.default_rng(int(eval_env.seed))
+        eval_env._block_counter = -1
         rnn.env = eval_env
         rnn.greedy = True
         rnn.force_optimal = False
@@ -353,6 +425,12 @@ def _evaluate_abcd(rnn, eval_env, num_eval, evaluation_mode):
         rnn.env = train_env
         rnn.greedy = train_greedy
         rnn.force_optimal = train_force_optimal
+        _restore_torch_rng_states(rng_states)
+        np.random.set_state(numpy_rng_state)
+        _restore_agent_transient_state(
+            rnn, transient_state, transient_state_missing
+        )
+        _restore_abcd_environment_state(eval_env, eval_environment_state)
 
     metrics = {
         "evaluation_mode": str(evaluation_mode),
@@ -364,6 +442,8 @@ def _evaluate_abcd(rnn, eval_env, num_eval, evaluation_mode):
             )
         ),
         "evaluation_task_seed": int(eval_env.seed),
+        "validation_recurrent_noise_seed": int(validation_seed),
+        "validation_rng_replayed": True,
         "loss": float(np.mean(block_losses)),
         "accuracy": float(np.nanmean(block_accuracies)),
         "block_losses": block_losses,
@@ -388,6 +468,50 @@ def _evaluate_heldout(rnn, eval_env, num_eval):
         num_eval,
         evaluation_mode="heldout",
     )
+
+
+def _validation_checkpoint_is_better(
+    accuracy,
+    loss,
+    *,
+    best_accuracy,
+    best_loss,
+):
+    """Rank ABCD checkpoints by accuracy, then total validation loss."""
+
+    candidate_accuracy = float(accuracy)
+    incumbent_accuracy = float(best_accuracy)
+    if np.isnan(candidate_accuracy):
+        candidate_accuracy = -np.inf
+    if np.isnan(incumbent_accuracy):
+        incumbent_accuracy = -np.inf
+    return bool(
+        candidate_accuracy > incumbent_accuracy
+        or (
+            candidate_accuracy == incumbent_accuracy
+            and float(loss) < float(best_loss)
+        )
+    )
+
+
+def _best_accuracy_from_history(validation_history, best_update):
+    """Recover the selected checkpoint accuracy from resumable history."""
+
+    if best_update is None:
+        return -np.inf
+    matches = [
+        row
+        for row in validation_history
+        if int(row["update"]) == int(best_update)
+    ]
+    if not matches:
+        raise ValueError(
+            f"best.pt update {best_update} has no validation-history row."
+        )
+    accuracy = matches[-1].get("accuracy")
+    if accuracy is None or np.isnan(float(accuracy)):
+        return -np.inf
+    return float(accuracy)
 
 
 @torch.no_grad()
@@ -696,6 +820,7 @@ def main_train(kwargs):
     managed_validation_metrics = []
     fmri_factorial_metrics = None
     best_loss = np.inf
+    best_accuracy = -np.inf
     best_update = None
     start_update = 0
     epoch = -1  # permits a setup/save-only run with num_epochs=0
@@ -739,6 +864,9 @@ def main_train(kwargs):
             np.nan if row["accuracy"] is None else float(row["accuracy"])
             for row in validation_history
         ]
+        best_accuracy = _best_accuracy_from_history(
+            validation_history, best_update
+        )
         checkpointed_validation_updates = {
             int(row["update"]) for row in validation_history
         }
@@ -785,8 +913,22 @@ def main_train(kwargs):
                     loss, acc = rnn.eval(num_eval = kwargs["num_eval"])
                 all_losses.append(loss)
                 all_accs.append(acc)
-                if loss <= best_loss:
+                if task == "abcd_fmri":
+                    checkpoint_is_better = _validation_checkpoint_is_better(
+                        acc,
+                        loss,
+                        best_accuracy=best_accuracy,
+                        best_loss=best_loss,
+                    )
+                else:
+                    # Preserve the original-task checkpoint rule unchanged.
+                    checkpoint_is_better = loss <= best_loss
+                if checkpoint_is_better:
                     best_loss = loss
+                    if task == "abcd_fmri":
+                        best_accuracy = (
+                            -np.inf if np.isnan(float(acc)) else float(acc)
+                        )
                     best_update = epoch
                     if kwargs["save_results"]:
                         if managed_run:
@@ -816,7 +958,6 @@ def main_train(kwargs):
                             "elapsed_minutes": float(elapsed_minutes),
                         }
                     )
-                    run_manager.save_validation_curve(run_dir, validation_history)
                     managed_validation_metrics.append(dict(metrics))
                     run_manager.save_validation_metrics(
                         run_dir, managed_validation_metrics
@@ -856,6 +997,13 @@ def main_train(kwargs):
                     eval_env=eval_env,
                 ),
             )
+            if validation_history:
+                run_manager.save_validation_curve(
+                    run_dir,
+                    validation_history,
+                    best_update=best_update,
+                    latest_checkpoint_update=completed_updates,
+                )
 
     if fmri_factorial_schedule is not None:
         _, _, fmri_factorial_metrics = evaluate_abcd_fmri_factorial(

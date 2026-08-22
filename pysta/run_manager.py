@@ -996,7 +996,10 @@ def capture_rng_state() -> dict[str, Any]:
         # loadable under torch's restricted weights_only=True unpickler.
         "numpy": {
             "bit_generator": str(numpy_state[0]),
-            "keys": torch.as_tensor(numpy_state[1].copy(), dtype=torch.uint32),
+            "keys": torch.as_tensor(
+                numpy_state[1].astype(np.int64, copy=True),
+                dtype=torch.int64,
+            ),
             "position": int(numpy_state[2]),
             "has_gauss": int(numpy_state[3]),
             "cached_gaussian": float(numpy_state[4]),
@@ -1171,11 +1174,75 @@ def load_latest_checkpoint(
     )
 
 
+def _validation_curve_checkpoint_summary(
+    validation_history: Sequence[Mapping[str, Any]],
+    *,
+    best_update: int | None = None,
+    latest_checkpoint_update: int | None = None,
+) -> dict[str, Any]:
+    """Bind checkpoint roles to the existing validation measurements."""
+    if not validation_history:
+        raise ValueError("A validation curve requires at least one evaluation.")
+    rows = list(validation_history)
+    if best_update is None:
+        # ABCD training ranks checkpoints by highest validation accuracy, then
+        # lower total validation loss. Keep the earliest point on a complete
+        # tie because neither declared criterion distinguishes it.
+        def checkpoint_rank(index: int) -> tuple[float, float, int]:
+            row = rows[index]
+            accuracy = row.get("accuracy")
+            accuracy = -np.inf if accuracy is None else float(accuracy)
+            if np.isnan(accuracy):
+                accuracy = -np.inf
+            return (-accuracy, float(row["loss"]), index)
+
+        best_index = min(
+            range(len(rows)),
+            key=checkpoint_rank,
+        )
+        best_update = int(rows[best_index]["update"])
+    else:
+        best_update = int(best_update)
+        matches = [
+            index
+            for index, row in enumerate(rows)
+            if int(row["update"]) == best_update
+        ]
+        if not matches:
+            raise ValueError(
+                f"best.pt update {best_update} has no validation-history row."
+            )
+        best_index = matches[-1]
+
+    latest_validation_index = len(rows) - 1
+    latest_validation_update = int(rows[latest_validation_index]["update"])
+    if latest_checkpoint_update is None:
+        latest_checkpoint_update = latest_validation_update
+    return {
+        "best_index": int(best_index),
+        "best_update": int(best_update),
+        "best_row": rows[best_index],
+        "latest_validation_index": int(latest_validation_index),
+        "latest_validation_update": int(latest_validation_update),
+        "latest_validation_row": rows[latest_validation_index],
+        "latest_checkpoint_update": int(latest_checkpoint_update),
+    }
+
+
 def save_validation_curve(
-    run_dir: Path, validation_history: Sequence[Mapping[str, Any]]
+    run_dir: Path,
+    validation_history: Sequence[Mapping[str, Any]],
+    *,
+    best_update: int | None = None,
+    latest_checkpoint_update: int | None = None,
 ) -> tuple[Path, Path]:
-    """Persist a compact machine-readable and human-readable learning curve."""
+    """Persist metrics plus an explicit best/latest checkpoint curve."""
     run_dir = Path(run_dir)
+    checkpoint_summary = _validation_curve_checkpoint_summary(
+        validation_history,
+        best_update=best_update,
+        latest_checkpoint_update=latest_checkpoint_update,
+    )
     csv_path = run_dir / "validation_curve.csv"
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -1187,11 +1254,35 @@ def save_validation_curve(
         delete=False,
     ) as stream:
         temporary_csv = Path(stream.name)
-        columns = ("update", "loss", "accuracy", "best_loss", "elapsed_minutes")
+        columns = (
+            "update",
+            "loss",
+            "accuracy",
+            "best_loss",
+            "elapsed_minutes",
+            "checkpoint_role",
+            "latest_checkpoint_update",
+        )
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
-        for row in validation_history:
-            writer.writerow({key: row.get(key) for key in columns})
+        for index, row in enumerate(validation_history):
+            roles = []
+            if index == checkpoint_summary["best_index"]:
+                roles.append("best.pt")
+            if index == checkpoint_summary["latest_validation_index"]:
+                roles.append("latest.pt:last_validation")
+            csv_row = {
+                key: row.get(key)
+                for key in columns
+                if key not in {"checkpoint_role", "latest_checkpoint_update"}
+            }
+            csv_row["checkpoint_role"] = ";".join(roles)
+            csv_row["latest_checkpoint_update"] = (
+                checkpoint_summary["latest_checkpoint_update"]
+                if index == checkpoint_summary["latest_validation_index"]
+                else ""
+            )
+            writer.writerow(csv_row)
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary_csv, csv_path)
@@ -1207,14 +1298,80 @@ def save_validation_curve(
     accuracies = np.asarray(
         [row["accuracy"] for row in validation_history], dtype=float
     )
-    figure, axes = plt.subplots(1, 2, figsize=(8.0, 3.2), constrained_layout=True)
+    figure, axes = plt.subplots(1, 2, figsize=(9.4, 4.2), constrained_layout=True)
     axes[0].plot(updates, losses, color="#305c89", marker="o", ms=3)
-    axes[0].set(xlabel="optimizer updates", ylabel="validation loss")
+    axes[0].set(xlabel="optimizer updates", ylabel="total validation loss")
     axes[0].grid(alpha=0.2)
     axes[1].plot(updates, accuracies, color="#9b3d4a", marker="o", ms=3)
     axes[1].set(xlabel="optimizer updates", ylabel="validation accuracy")
     axes[1].set_ylim(-0.02, 1.02)
     axes[1].grid(alpha=0.2)
+
+    best_index = checkpoint_summary["best_index"]
+    latest_index = checkpoint_summary["latest_validation_index"]
+    same_validation_point = best_index == latest_index
+    for axis, values in zip(axes, (losses, accuracies)):
+        if same_validation_point:
+            axis.scatter(
+                updates[best_index],
+                values[best_index],
+                marker="D",
+                s=65,
+                facecolor="#f2c14e",
+                edgecolor="black",
+                linewidth=0.7,
+                zorder=5,
+                label="best.pt / latest validation",
+            )
+        else:
+            axis.scatter(
+                updates[best_index],
+                values[best_index],
+                marker="*",
+                s=105,
+                facecolor="#f2c14e",
+                edgecolor="black",
+                linewidth=0.7,
+                zorder=5,
+                label="best.pt",
+            )
+            axis.scatter(
+                updates[latest_index],
+                values[latest_index],
+                marker="s",
+                s=46,
+                facecolor="#62b6cb",
+                edgecolor="black",
+                linewidth=0.7,
+                zorder=5,
+                label="latest.pt: latest validation",
+            )
+        axis.legend(loc="best", fontsize=7.5, framealpha=0.9)
+
+    best_row = checkpoint_summary["best_row"]
+    latest_row = checkpoint_summary["latest_validation_row"]
+    best_text = (
+        f"best.pt | update {checkpoint_summary['best_update']} | "
+        f"performance={float(best_row['accuracy']):.5g} | "
+        f"total validation loss={float(best_row['loss']):.5g}"
+    )
+    same_checkpoint_point = (
+        same_validation_point
+        and checkpoint_summary["best_update"]
+        == checkpoint_summary["latest_checkpoint_update"]
+    )
+    if same_checkpoint_point:
+        checkpoint_text = best_text.replace("best.pt", "best.pt = latest.pt", 1)
+    else:
+        latest_text = (
+            f"latest.pt | update {checkpoint_summary['latest_checkpoint_update']} | "
+            f"latest validation at update "
+            f"{checkpoint_summary['latest_validation_update']}: "
+            f"performance={float(latest_row['accuracy']):.5g} | "
+            f"total validation loss={float(latest_row['loss']):.5g}"
+        )
+        checkpoint_text = f"{best_text}\n{latest_text}"
+    figure.suptitle(checkpoint_text, fontsize=9.0)
 
     png_path = run_dir / "validation_curve.png"
     with tempfile.NamedTemporaryFile(
@@ -1249,6 +1406,8 @@ def save_validation_metrics(
         "configuration_bank_name",
         "configuration_bank_statistics",
         "evaluation_task_seed",
+        "validation_recurrent_noise_seed",
+        "validation_rng_replayed",
         "evaluation_recurrent_noise",
         "loss",
         "accuracy",
@@ -1411,5 +1570,10 @@ def import_legacy_run(
     save_checkpoint(run_dir, best_payload)
     save_checkpoint(run_dir, latest_payload)
     if validation_history:
-        save_validation_curve(run_dir, validation_history)
+        save_validation_curve(
+            run_dir,
+            validation_history,
+            best_update=best_update,
+            latest_checkpoint_update=completed_updates,
+        )
     return run_dir

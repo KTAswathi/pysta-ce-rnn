@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Mapping
 
 from .envs import MazeEnv
@@ -348,13 +349,42 @@ def _fmri_base_configuration_bank(kwargs: Mapping[str, object]):
     return bases
 
 
+def _fmri_common_start_location(
+    configuration: tuple[int, int, int, int], evaluation_seed: int
+) -> int:
+    """Choose a stable scanner-evaluation start that is neither A nor D.
+
+    The human fMRI references do not specify a scanner starting-location rule,
+    so this is an explicit RNN modelling choice.  Hashing the existing final
+    evaluation seed together with the complete base-configuration identity
+    makes the choice reproducible and independent of factorial condition (and
+    of the position at which a base happens to appear in the schedule).
+    """
+    configuration = tuple(int(location) for location in configuration)
+    candidates = tuple(
+        location
+        for location in range(9)
+        if location not in (configuration[0], configuration[3])
+    )
+    identity = (
+        "abcd-fmri-common-start-v1|"
+        f"{int(evaluation_seed)}|"
+        + ",".join(str(location) for location in configuration)
+    )
+    digest = sha256(identity.encode("ascii")).digest()
+    return candidates[int.from_bytes(digest[:8], "big") % len(candidates)]
+
+
 def make_fmri_evaluation_schedule(kwargs: Mapping[str, object]):
     """Build the fixed 5 x 2 x 2 scanner-style evaluation schedule.
 
     Ordering is base-major, then FORWARD/BACKWARD instruction direction, then
     SAME/REVERSE execution relation. Each cell is an independent batch-one
     environment, ensuring that ``BaseAgent.forward()`` resets the hidden state
-    once per block without randomly resampling any factorial variable.
+    once per block without randomly resampling any factorial variable.  Each
+    base has one deterministic common start, excluding its A and D locations,
+    across all four factorial cells.  This start rule is an RNN modelling
+    choice because the human fMRI references do not specify it.
     """
     from .abcd_env import (
         ABCDFMRIEnv,
@@ -375,9 +405,10 @@ def make_fmri_evaluation_schedule(kwargs: Mapping[str, object]):
     schedule = []
     factorial_index = 0
     for base_index, configuration in enumerate(bases):
-        # Reuse the same task seed across all four conditions of a spatial
-        # base. This makes the schedule reproducible and aligns stochastic
-        # start sampling as closely as target-exclusion permits.
+        # A and D are the two possible first execution targets across the four
+        # factorial cells.  Fix one other location for the whole base so start
+        # position cannot encode instruction direction or execution relation.
+        common_start = _fmri_common_start_location(configuration, base_seed)
         cell_seed = base_seed + base_index
         for instruction_direction in (FORWARD, BACKWARD):
             for execution_relation in (SAME, REVERSE):
@@ -397,10 +428,8 @@ def make_fmri_evaluation_schedule(kwargs: Mapping[str, object]):
                     max_navigation_steps=int(
                         _value(kwargs, "max_navigation_steps", 200)
                     ),
-                    start_policy=_value(
-                        kwargs, "start_position_policy", "exclude_first_goal"
-                    ),
-                    fixed_start=kwargs.get("start_position"),
+                    start_policy="fixed",
+                    fixed_start=common_start,
                     min_manhattan_distance=int(
                         _value(kwargs, "min_goal_distance", 2)
                     ),

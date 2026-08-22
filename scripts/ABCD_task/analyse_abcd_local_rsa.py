@@ -556,6 +556,31 @@ def cosine_rdm(features: np.ndarray) -> np.ndarray:
     return np.clip(1.0 - similarity, 0.0, 2.0)
 
 
+def reward_a_feedback_rdm(
+    is_reward: np.ndarray,
+    abstract_goal: np.ndarray,
+) -> np.ndarray:
+    """Human-method visual-feedback nuisance RDM.
+
+    The special feedback text is shown only at reward A.  The detailed human
+    method retains the abstract-task RDM similarity for reward-A/reward-A
+    comparisons (zero dissimilarity) and sets every other comparison to
+    maximal dissimilarity (one).  Comparisons excluded from the RSA, including
+    path--reward entries and the diagonal, are handled by
+    :func:`valid_rdm_entries`; they are not given an alternative similarity
+    structure here.
+    """
+
+    reward = np.asarray(is_reward, dtype=bool).reshape(-1)
+    goal = np.asarray(abstract_goal, dtype=int).reshape(-1)
+    if reward.shape != goal.shape:
+        raise ValueError("Reward and abstract-goal condition arrays must align.")
+    reward_a = reward & (goal == 0)
+    feedback = np.ones((len(reward_a), len(reward_a)), dtype=float)
+    feedback[np.ix_(reward_a, reward_a)] = 0.0
+    return feedback
+
+
 def build_model_rdms(design: ConditionDesign) -> tuple[np.ndarray, tuple[str, ...]]:
     """Build the four split-DSR and five control RDMs described in the PDF."""
 
@@ -578,12 +603,7 @@ def build_model_rdms(design: ConditionDesign) -> tuple[np.ndarray, tuple[str, ..
     )
     rdms.append(cosine_rdm(l2_features))
 
-    # Binary visual-feedback control: two conditions are dissimilar exactly
-    # when one, but not both, is the special reward-A condition.  Two non-A
-    # conditions therefore have zero feedback dissimilarity.
-    reward_a = design.is_reward & (design.abstract_goal == 0)
-    feedback = (reward_a[:, None] != reward_a[None, :]).astype(float)
-    rdms.append(feedback)
+    rdms.append(reward_a_feedback_rdm(design.is_reward, design.abstract_goal))
     rdms.append(normalized_hamming_rdm(design.current_action_sequence))
     rdms.append(normalized_hamming_rdm(design.next_action_sequence))
 
@@ -790,6 +810,22 @@ def weighted_com(
     return np.sum(coords[valid] * weight[valid, None], axis=0) / denominator
 
 
+def positive_evidence_is_valid(p90_cutoff: float, strongest_mass: float) -> bool:
+    """Return the additional interpretation gate for one split-DSR beta map.
+
+    This is deliberately separate from the reference-matched p90 component
+    and signed COM calculation.  It is a necessary, not sufficient, condition
+    for interpreting a four-COM spatial trend as a reproduced gradient.
+    """
+
+    return bool(
+        np.isfinite(p90_cutoff)
+        and np.isfinite(strongest_mass)
+        and p90_cutoff > 0.0
+        and strongest_mass > 0.0
+    )
+
+
 def summarize_beta_map(
     beta: np.ndarray,
     unit_coordinates: np.ndarray,
@@ -797,7 +833,7 @@ def summarize_beta_map(
     anchor_distance: np.ndarray,
     percentile: float = 90.0,
 ) -> dict:
-    """Human-code-matched strongest p90 component plus one all-positive sensitivity."""
+    """Reference-matched signed COM plus a separate positive-evidence gate."""
 
     values = np.asarray(beta, dtype=float).reshape(-1)
     coords = np.asarray(unit_coordinates, dtype=float)
@@ -846,6 +882,9 @@ def summarize_beta_map(
         "primary_surface_z": float(primary_xyz[2]),
         "primary_anchor_distance": primary_anchor,
         "primary_mass": primary_mass,
+        "positive_evidence_valid": positive_evidence_is_valid(
+            cutoff, primary_mass
+        ),
         "all_positive_xyz": sensitivity_xyz,
         "all_positive_surface_z": float(sensitivity_xyz[2]),
         "all_positive_anchor_distance": sensitivity_anchor,
@@ -1028,15 +1067,16 @@ def _plot_summary(
 
     axis = figure.add_subplot(grid[1, 0])
     x = np.arange(4)
-    primary_mass = np.asarray([item["primary_mass"] for item in spatial])
-    nonpositive_component = primary_mass <= 0
+    positive_evidence_invalid = ~np.asarray(
+        [item["positive_evidence_valid"] for item in spatial], dtype=bool
+    )
     primary_z = np.asarray([item["primary_surface_z"] for item in spatial])
     axis.plot(x, primary_z, "o-", label="human-code p90 (signed)")
     axis.plot(x, [item["all_positive_surface_z"] for item in spatial], "s--", label="all-positive sensitivity")
     axis.scatter(
-        x[nonpositive_component], primary_z[nonpositive_component], marker="x",
+        x[positive_evidence_invalid], primary_z[positive_evidence_invalid], marker="x",
         s=75, linewidths=2, color="crimson", zorder=5,
-        label="p90 component mass ≤0",
+        label="positive-evidence criterion failed",
     )
     axis.set_xticks(x, ["0–2", "3–5", "6–8", "9–11"])
     axis.set_xlabel("normalized DSR horizon")
@@ -1048,7 +1088,7 @@ def _plot_summary(
     axis.plot(x, primary_anchor, "o-", label="human-code p90 (signed)")
     axis.plot(x, [item["all_positive_anchor_distance"] for item in spatial], "s--", label="all-positive sensitivity")
     axis.scatter(
-        x[nonpositive_component], primary_anchor[nonpositive_component], marker="x",
+        x[positive_evidence_invalid], primary_anchor[positive_evidence_invalid], marker="x",
         s=75, linewidths=2, color="crimson", zorder=5,
     )
     axis.set_xticks(x, ["0–2", "3–5", "6–8", "9–11"])
@@ -1150,6 +1190,12 @@ def run_analysis(
         )
         for split in range(4)
     ]
+    positive_evidence_valid = np.asarray(
+        [item["positive_evidence_valid"] for item in spatial], dtype=bool
+    )
+    all_splits_positive_evidence_valid = bool(
+        np.all(positive_evidence_valid)
+    )
 
     output_dir = analysis_root / "local_rsa"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1187,6 +1233,10 @@ def run_analysis(
         primary_p90_cutoff=np.asarray([item["cutoff"] for item in spatial]),
         primary_component_mass=np.asarray([item["primary_mass"] for item in spatial]),
         primary_component_count=np.asarray([item["n_components"] for item in spatial]),
+        positive_evidence_valid=positive_evidence_valid,
+        all_splits_positive_evidence_valid=np.asarray(
+            all_splits_positive_evidence_valid
+        ),
     )
     rows = []
     for split, item in enumerate(spatial):
@@ -1204,6 +1254,7 @@ def run_analysis(
                 "p90_n_components": item["n_components"],
                 "p90_strongest_mass": item["primary_mass"],
                 "p90_component_positive_mass": bool(item["primary_mass"] > 0),
+                "positive_evidence_valid": item["positive_evidence_valid"],
                 "p90_com_fslr_x": item["primary_xyz"][0],
                 "p90_com_fslr_y": item["primary_xyz"][1],
                 "p90_com_surface_z": item["primary_surface_z"],
@@ -1244,6 +1295,10 @@ def run_analysis(
         ],
         "split_horizons": [list(values) for values in SPLIT_HORIZONS],
         "rdm_entries": "upper triangle; path-path and reward-reward only",
+        "reward_a_feedback_rdm": (
+            "0 only for reward-A/reward-A comparisons; 1 for every other "
+            "comparison, matching the detailed human-fMRI control construction"
+        ),
         "data_rdm": "symmetrized cross-repeat Spearman distance",
         "regression": "joint unstandardized OLS with intercept",
         "predictor_names": list(predictor_names),
@@ -1263,6 +1318,32 @@ def run_analysis(
             "beta strictly above ROI p90; surface connected components; strongest "
             "summed-beta component; beta-mass COM"
         ),
+        "reference_matched_com_calculation": (
+            "The signed beta-mass COM is always retained when mathematically "
+            "defined, including when the additional positive-evidence criterion "
+            "fails. The p90 threshold, strongest-component selection, and COM "
+            "calculation are unchanged."
+        ),
+        "gradient_reproduction_positive_evidence": {
+            "criterion": (
+                "For every split-DSR map: primary p90 cutoff > 0 and selected "
+                "strongest component signed beta mass > 0."
+            ),
+            "per_split_positive_evidence_valid": [
+                bool(value) for value in positive_evidence_valid
+            ],
+            "all_splits_positive_evidence_valid": (
+                all_splits_positive_evidence_valid
+            ),
+            "interpretation": (
+                "This is an additional pre-specified necessary validity gate, "
+                "not part of the reference-matched COM calculation and not by "
+                "itself proof of a gradient. A COM slope cannot be labelled a "
+                "reproduced primary human-like gradient unless this field is "
+                "true; raw activity, Csubs, and the all-positive sensitivity "
+                "cannot rescue a failure."
+            ),
+        },
         "single_spatial_sensitivity": "all-positive whole-map beta-mass COM",
         "coordinate_system": "fsLR/Conte69 surface coordinates; not human MNI",
         "embedding_dir": str(embedding_dir),
